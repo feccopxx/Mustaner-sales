@@ -1,0 +1,11 @@
+node_modules/
+dist/
+dist-server/
+.env
+.env.*
+!.env.example
+.railway/
+coverage/
+*.log
+.site-evidence/
+INTAKE*.html

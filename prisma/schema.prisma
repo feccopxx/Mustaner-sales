@@ -1,0 +1,104 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum CourseStatus {
+  DRAFT
+  PUBLISHED
+}
+
+enum FieldVisibility {
+  PUBLIC
+  INTERNAL
+}
+
+enum MediaType {
+  IMAGE
+  PDF
+  VIDEO
+  DOCUMENT
+  OTHER
+}
+
+model AppConfig {
+  id           Int      @id @default(1)
+  passwordHash String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+model Course {
+  id               String        @id @db.VarChar(64)
+  name             String
+  shortDescription String        @default("")
+  price            String        @default("")
+  curriculum       String        @default("")
+  howToSell        String        @default("")
+  status           CourseStatus  @default(DRAFT)
+  archivedAt       DateTime?
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+  customFields     CustomField[]
+  mediaLinks       MediaLink[]
+  revisions        CourseRevision[]
+
+  @@index([status, archivedAt])
+  @@index([name])
+}
+
+model CustomField {
+  id         String          @id @default(cuid())
+  name       String
+  content    String          @default("")
+  visibility FieldVisibility @default(INTERNAL)
+  position   Int             @default(0)
+  courseId   String
+  course     Course          @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  @@unique([courseId, name])
+}
+
+model MediaLink {
+  id          String    @id @default(cuid())
+  label       String
+  url         String
+  type        MediaType @default(OTHER)
+  description String    @default("")
+  position    Int       @default(0)
+  courseId    String
+  course      Course    @relation(fields: [courseId], references: [id], onDelete: Cascade)
+}
+
+model ApiKey {
+  id         String    @id @default(cuid())
+  name       String
+  prefix     String
+  keyHash    String    @unique
+  scopes     String[]
+  createdAt  DateTime  @default(now())
+  lastUsedAt DateTime?
+  revokedAt  DateTime?
+}
+
+model CourseRevision {
+  id        String   @id @default(cuid())
+  courseId  String
+  course    Course   @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  snapshot  Json
+  createdAt DateTime @default(now())
+  @@index([courseId, createdAt])
+}
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  action     String
+  entityType String
+  entityId   String?
+  metadata   Json?
+  createdAt  DateTime @default(now())
+  @@index([createdAt])
+}
