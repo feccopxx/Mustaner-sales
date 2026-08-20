@@ -135,6 +135,6 @@ app.get('/api/v1/courses/:id', apiAuth, async (req, res) => {
 });
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const clientDir = path.resolve(here, '../../dist');
+const clientDir = path.resolve(here, '../dist');
 app.use(express.static(clientDir));
 app.get('*splat', (_req, res) => res.sendFile(path.join(clientDir, 'index.html')));
