@@ -8,4 +8,5 @@ dist-server/
 coverage/
 *.log
 .site-evidence/
+.superpowers/
 INTAKE*.html
