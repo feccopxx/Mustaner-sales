@@ -9,7 +9,7 @@
   "scripts": {
     "dev": "concurrently \"vite\" \"tsx watch server/index.ts\"",
     "build": "vite build && tsc -p tsconfig.server.json",
-    "start": "prisma migrate deploy && node dist-server/server/index.js",
+    "start": "prisma migrate deploy && node dist-server/index.js",
     "test": "vitest run",
     "test:watch": "vitest",
     "prisma:generate": "prisma generate",
