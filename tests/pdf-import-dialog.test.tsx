@@ -8,6 +8,12 @@ vi.mock('../src/api.js', () => ({ api: (...args: unknown[]) => apiMock(...args) 
 describe('PDF course import panel', () => {
   beforeEach(() => apiMock.mockReset());
 
+  it('shows the approved PDF extraction illustration', () => {
+    render(<PdfImport onImport={vi.fn()} />);
+
+    expect(screen.getByRole('img', { name: 'Professional organizing PDF course data into structured learning information' })).toHaveAttribute('src', '/assets/pdf-import-illustration.png');
+  });
+
   it('shows the AI questions when an imported PDF has incomplete details', async () => {
     apiMock.mockResolvedValue({
       draft: { id: '', name: 'AI Growth', shortDescription: '', price: '', curriculum: '', howToSell: '', status: 'DRAFT', customFields: [], mediaLinks: [] },
