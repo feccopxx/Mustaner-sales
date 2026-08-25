@@ -9,9 +9,12 @@ import { courseInputSchema } from './domain.js';
 import { createApiKey, hashPassword, verifyApiKey, verifyPassword } from './security.js';
 import { csrfGuard, issueSession, newCsrfToken, requireAdmin } from './auth.js';
 import { projectCourse } from './course-projection.js';
+import multer from 'multer';
+import { createPdfAiClient, extractPdfCourseDraft, validatePdfUpload } from './pdf-import.js';
 
 const include = { customFields: true, mediaLinks: true } as const;
 const param = (value: string | string[]) => Array.isArray(value) ? value[0] : value;
+const pdfUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024, files: 1 } });
 export const app = express();
 app.set('trust proxy', 1);
 app.use(helmet({ contentSecurityPolicy: false }));
@@ -53,6 +56,17 @@ app.post('/api/admin/courses', requireAdmin, async (req, res) => {
     await prisma.auditLog.create({ data: { action: 'course.created', entityType: 'course', entityId: created.id } });
     res.status(201).json(created);
   } catch { res.status(409).json({ error: 'Course ID or custom field name already exists' }); }
+});
+app.post('/api/admin/courses/import-pdf', requireAdmin, pdfUpload.single('pdf'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'Choose a PDF file to import' });
+  try {
+    validatePdfUpload(req.file);
+    const apiKey = process.env.OPEN_AI_API_KEY;
+    if (!apiKey) return res.status(503).json({ error: 'OPEN_AI_API_KEY is not configured' });
+    res.json(await extractPdfCourseDraft(req.file.buffer, req.file.originalname, createPdfAiClient(apiKey)));
+  } catch (error) {
+    res.status(422).json({ error: error instanceof Error ? error.message : 'The PDF could not be imported' });
+  }
 });
 app.put('/api/admin/courses/:id', requireAdmin, async (req, res) => {
   const courseId = param(req.params.id);
