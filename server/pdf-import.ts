@@ -1,4 +1,4 @@
-import { validateCourseInput, type CourseInput } from './domain.js';
+import type { CourseInput } from './domain.js';
 import OpenAI from 'openai';
 
 export type PdfImportQuestion = { field: keyof Pick<CourseInput, 'id' | 'name' | 'shortDescription' | 'price' | 'curriculum' | 'howToSell'>; question: string };
@@ -20,6 +20,23 @@ export function normalizePdfCourseDraft(value: CourseInput) {
 export function validatePdfUpload(file: { mimetype: string; originalname: string; size: number }) {
   if (file.mimetype !== 'application/pdf' || !file.originalname.toLowerCase().endsWith('.pdf')) throw new Error('Upload a PDF file');
   if (file.size === 0) throw new Error('The PDF file is empty');
+}
+
+const label = (key: string) => key.replace(/([a-z])([A-Z])/g, '$1 $2').replace(/^./, (char) => char.toUpperCase());
+const textValue = (value: unknown): string => {
+  if (typeof value === 'string') return value.trim();
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (Array.isArray(value)) return value.map((item) => `- ${textValue(item)}`).filter(Boolean).join('\n');
+  if (value && typeof value === 'object') return Object.entries(value).map(([key, item]) => `${label(key)}: ${textValue(item)}`).filter((item) => !item.endsWith(': ')).join('\n');
+  return '';
+};
+const record = (value: unknown): Record<string, unknown> => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
+
+export function parsePdfCourseDraft(value: unknown): CourseInput {
+  const raw = record(value);
+  const customFields = Array.isArray(raw.customFields) ? raw.customFields.map(record).filter((field) => textValue(field.name)).map((field) => ({ name: textValue(field.name), content: textValue(field.content), visibility: field.visibility === 'PUBLIC' ? 'PUBLIC' as const : 'INTERNAL' as const })) : [];
+  const mediaLinks = Array.isArray(raw.mediaLinks) ? raw.mediaLinks.map(record).filter((media) => textValue(media.label) && textValue(media.url)).map((media) => ({ label: textValue(media.label), url: textValue(media.url), type: ['IMAGE', 'PDF', 'VIDEO', 'DOCUMENT', 'OTHER'].includes(textValue(media.type)) ? textValue(media.type) as CourseInput['mediaLinks'][number]['type'] : 'OTHER', description: textValue(media.description) })) : [];
+  return { id: textValue(raw.id), name: textValue(raw.name), shortDescription: textValue(raw.shortDescription), price: textValue(raw.price), curriculum: textValue(raw.curriculum), howToSell: textValue(raw.howToSell), status: 'DRAFT', customFields, mediaLinks };
 }
 
 export type PdfAiClient = {
@@ -51,9 +68,7 @@ export async function extractPdfCourseDraft(pdf: Buffer, filename: string, clien
       input: [{ role: 'user', content: [{ type: 'input_text', text: extractionInstructions }, { type: 'input_file', file_id: file.id }] }],
       text: { format: { type: 'json_object' } },
     });
-    const parsed = validateCourseInput(JSON.parse(response.output_text));
-    if (!parsed.success) throw new Error('The PDF could not be converted into a valid course draft');
-    return normalizePdfCourseDraft(parsed.data);
+    return normalizePdfCourseDraft(parsePdfCourseDraft(JSON.parse(response.output_text)));
   } finally {
     await client.files.del(file.id);
   }

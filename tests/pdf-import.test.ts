@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { extractPdfCourseDraft, normalizePdfCourseDraft, validatePdfUpload } from '../server/pdf-import.js';
+import { extractPdfCourseDraft, normalizePdfCourseDraft, parsePdfCourseDraft, validatePdfUpload } from '../server/pdf-import.js';
 
 describe('PDF course import', () => {
   it('turns an extraction into an editable course draft', () => {
@@ -32,6 +32,17 @@ describe('PDF course import', () => {
       { field: 'curriculum', question: 'Please provide the course curriculum.' },
       { field: 'howToSell', question: 'Please provide guidance for selling this course.' },
     ]);
+  });
+
+  it('keeps structured price and curriculum values returned for a real course PDF', () => {
+    const draft = parsePdfCourseDraft({
+      id: '', name: 'AI Automation System Architect', shortDescription: 'Design AI systems.',
+      price: { earlyBird: '15,000 EGP', standard: '17,000 EGP' },
+      curriculum: ['Design systems', 'Build agents'], howToSell: '', customFields: [], mediaLinks: [],
+    });
+
+    expect(draft.price).toBe('Early Bird: 15,000 EGP\nStandard: 17,000 EGP');
+    expect(draft.curriculum).toBe('- Design systems\n- Build agents');
   });
 
   it('deletes the OpenAI file after extracting a course draft', async () => {
