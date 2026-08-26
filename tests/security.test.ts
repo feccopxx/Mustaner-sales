@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { createApiKey, hashPassword, verifyApiKey, verifyPassword } from '../server/security.js';
+import { createApiKey, hashPassword, synchronizePasswordHash, verifyApiKey, verifyPassword } from '../server/security.js';
 
 describe('security primitives', () => {
   it('hashes and verifies the app password with Argon2id', async () => {
@@ -7,6 +7,15 @@ describe('security primitives', () => {
     expect(hash).toMatch(/^\$argon2id\$/);
     expect(await verifyPassword(hash, 'correct horse battery staple')).toBe(true);
     expect(await verifyPassword(hash, 'wrong')).toBe(false);
+  });
+
+  it('replaces a persisted bootstrap hash when the configured password changes', async () => {
+    const previousHash = await hashPassword('old deployment password');
+
+    const synchronizedHash = await synchronizePasswordHash(previousHash, 'current configured password');
+
+    expect(await verifyPassword(synchronizedHash, 'current configured password')).toBe(true);
+    expect(await verifyPassword(synchronizedHash, 'old deployment password')).toBe(false);
   });
 
   it('creates a one-time plaintext API key and stores a SHA-256 hash', () => {

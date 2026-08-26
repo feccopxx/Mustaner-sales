@@ -6,7 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { prisma } from './prisma.js';
 import { courseInputSchema } from './domain.js';
-import { createApiKey, hashPassword, verifyApiKey, verifyPassword } from './security.js';
+import { createApiKey, hashPassword, synchronizePasswordHash, verifyApiKey, verifyPassword } from './security.js';
 import { csrfGuard, issueSession, newCsrfToken, requireAdmin } from './auth.js';
 import { projectCourse } from './course-projection.js';
 import multer from 'multer';
@@ -28,11 +28,14 @@ app.get('/api/health', (_req, res) => res.json({ status: 'ok' }));
 app.get('/api/auth/session', requireAdmin, (_req, res) => res.json({ authenticated: true }));
 app.post('/api/auth/login', loginLimiter, async (req, res) => {
   const password = typeof req.body?.password === 'string' ? req.body.password : '';
+  const bootstrap = process.env.APP_PASSWORD;
+  if (!bootstrap) return res.status(503).json({ error: 'APP_PASSWORD is not configured' });
   let config = await prisma.appConfig.findUnique({ where: { id: 1 } });
   if (!config) {
-    const bootstrap = process.env.APP_PASSWORD;
-    if (!bootstrap) return res.status(503).json({ error: 'APP_PASSWORD is not configured' });
     config = await prisma.appConfig.create({ data: { id: 1, passwordHash: await hashPassword(bootstrap) } });
+  } else {
+    const passwordHash = await synchronizePasswordHash(config.passwordHash, bootstrap);
+    if (passwordHash !== config.passwordHash) config = await prisma.appConfig.update({ where: { id: 1 }, data: { passwordHash } });
   }
   if (!(await verifyPassword(config.passwordHash, password))) return res.status(401).json({ error: 'Invalid password' });
   const csrf = newCsrfToken();

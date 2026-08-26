@@ -14,6 +14,10 @@ export function verifyPassword(hash: string, password: string) {
   return argon2.verify(hash, password);
 }
 
+export async function synchronizePasswordHash(storedHash: string, configuredPassword: string) {
+  return (await verifyPassword(storedHash, configuredPassword)) ? storedHash : hashPassword(configuredPassword);
+}
+
 const digest = (value: string) => createHash('sha256').update(value).digest();
 
 export function createApiKey() {
