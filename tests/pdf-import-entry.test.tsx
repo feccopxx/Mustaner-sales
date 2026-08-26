@@ -54,4 +54,20 @@ describe('PDF import entry point', () => {
     expect(screen.getByRole('heading', { name: 'Untitled course' })).toBeInTheDocument();
     expect(screen.queryByLabelText('Course PDF')).not.toBeInTheDocument();
   });
+
+  it('returns each selected archived course to the active library', async () => {
+    const archivedCourse = { id: '83', name: 'Archived AI Course', shortDescription: '', price: '', curriculum: '', howToSell: '', status: 'DRAFT', customFields: [], mediaLinks: [] };
+    apiMock.mockImplementation((path: string) => {
+      if (path === '/auth/session') return Promise.resolve({});
+      if (path === '/admin/courses?archived=true') return Promise.resolve([archivedCourse]);
+      return Promise.resolve([]);
+    });
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'View archive' }));
+    fireEvent.click(await screen.findByRole('checkbox', { name: 'Select Archived AI Course' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Return to Course' }));
+
+    await waitFor(() => expect(apiMock).toHaveBeenCalledWith('/admin/courses/83/restore', { method: 'POST' }));
+  });
 });
