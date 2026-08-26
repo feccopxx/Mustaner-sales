@@ -27,6 +27,8 @@ const customFieldSchema = z.object({
   visibility: z.enum(['PUBLIC', 'INTERNAL']),
 });
 
+export const globalFieldInputSchema = customFieldSchema;
+
 const mediaLinkSchema = z.object({
   label: z.string().trim().min(1).max(120),
   url: z.url(),

@@ -5,7 +5,7 @@ import rateLimit from 'express-rate-limit';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { prisma } from './prisma.js';
-import { courseInputSchema } from './domain.js';
+import { courseInputSchema, globalFieldInputSchema } from './domain.js';
 import { createApiKey, hashPassword, synchronizePasswordHash, verifyApiKey, verifyPassword } from './security.js';
 import { csrfGuard, issueSession, newCsrfToken, requireAdmin } from './auth.js';
 import { projectCourse } from './course-projection.js';
@@ -15,6 +15,11 @@ import { createPdfAiClient, extractPdfCourseDraft, validatePdfUpload } from './p
 const include = { customFields: true, mediaLinks: true } as const;
 const param = (value: string | string[]) => Array.isArray(value) ? value[0] : value;
 const pdfUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024, files: 1 } });
+const mergeGlobalFields = async (customFields: Array<{ name: string; content: string; visibility: 'PUBLIC' | 'INTERNAL' }>) => {
+  const templates = await prisma.globalField.findMany({ orderBy: { position: 'asc' } });
+  const names = new Set(customFields.map(field => field.name.trim().toLocaleLowerCase()));
+  return [...customFields, ...templates.filter(field => !names.has(field.name.trim().toLocaleLowerCase())).map(({ name, content, visibility }) => ({ name, content, visibility }))];
+};
 export const app = express();
 app.set('trust proxy', 1);
 app.use(helmet({ contentSecurityPolicy: false }));
@@ -55,10 +60,38 @@ app.post('/api/admin/courses', requireAdmin, async (req, res) => {
   if (!parsed.success) return res.status(400).json({ error: 'Invalid course', issues: parsed.error.issues });
   const { customFields, mediaLinks, ...course } = parsed.data;
   try {
-    const created = await prisma.course.create({ data: { ...course, customFields: { create: customFields.map((f, position) => ({ ...f, position })) }, mediaLinks: { create: mediaLinks.map((m, position) => ({ ...m, position })) } }, include });
+    const fields = await mergeGlobalFields(customFields);
+    const created = await prisma.course.create({ data: { ...course, customFields: { create: fields.map((f, position) => ({ ...f, position })) }, mediaLinks: { create: mediaLinks.map((m, position) => ({ ...m, position })) } }, include });
     await prisma.auditLog.create({ data: { action: 'course.created', entityType: 'course', entityId: created.id } });
     res.status(201).json(created);
   } catch { res.status(409).json({ error: 'Course ID or custom field name already exists' }); }
+});
+app.get('/api/admin/global-fields', requireAdmin, async (_req, res) => res.json(await prisma.globalField.findMany({ orderBy: { position: 'asc' } })));
+app.post('/api/admin/global-fields', requireAdmin, async (req, res) => {
+  const parsed = globalFieldInputSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'Invalid global field', issues: parsed.error.issues });
+  try {
+    const position = await prisma.globalField.count();
+    const field = await prisma.globalField.create({ data: { ...parsed.data, position } });
+    await prisma.auditLog.create({ data: { action: 'global_field.created', entityType: 'global_field', entityId: field.id } });
+    res.status(201).json(field);
+  } catch { res.status(409).json({ error: 'A global field with this name already exists' }); }
+});
+app.put('/api/admin/global-fields/:id', requireAdmin, async (req, res) => {
+  const parsed = globalFieldInputSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'Invalid global field', issues: parsed.error.issues });
+  try {
+    const field = await prisma.globalField.update({ where: { id: param(req.params.id) }, data: parsed.data });
+    await prisma.auditLog.create({ data: { action: 'global_field.updated', entityType: 'global_field', entityId: field.id } });
+    res.json(field);
+  } catch { res.status(404).json({ error: 'Global field not found or name is already in use' }); }
+});
+app.delete('/api/admin/global-fields/:id', requireAdmin, async (req, res) => {
+  try {
+    const field = await prisma.globalField.delete({ where: { id: param(req.params.id) } });
+    await prisma.auditLog.create({ data: { action: 'global_field.deleted', entityType: 'global_field', entityId: field.id } });
+    res.status(204).end();
+  } catch { res.status(404).json({ error: 'Global field not found' }); }
 });
 app.post('/api/admin/courses/import-pdf', requireAdmin, pdfUpload.single('pdf'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'Choose a PDF file to import' });

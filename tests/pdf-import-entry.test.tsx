@@ -42,7 +42,7 @@ describe('PDF import entry point', () => {
     await screen.findByRole('button', { name: 'View archive' });
     const navigation = screen.getByRole('navigation', { name: 'Workspace' });
     expect(Array.from(navigation.querySelectorAll('button')).map(button => button.textContent?.trim())).toEqual([
-      'Courses', 'API access', 'Audit log', 'View archive',
+      'Courses', 'API access', 'Audit log', 'Settings', 'View archive',
     ]);
   });
 

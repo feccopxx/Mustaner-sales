@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Archive, BookOpen, FileUp, KeyRound, LogOut, Plus, RotateCcw, Search, ShieldCheck } from 'lucide-react';
+import { Archive, BookOpen, FileUp, KeyRound, LogOut, Plus, RotateCcw, Search, Settings as SettingsIcon, ShieldCheck } from 'lucide-react';
 import { api } from './api.js';
 import type { Course } from './types.js';
 import { emptyCourse } from './types.js';
@@ -8,85 +8,33 @@ import { CourseEditor } from './components/CourseEditor.js';
 import { ApiKeys } from './components/ApiKeys.js';
 import { PdfImport } from './components/PdfImport.js';
 import { RevisionPanel, type Revision } from './components/RevisionPanel.js';
+import { Settings } from './components/Settings.js';
+
+type Page = 'courses' | 'keys' | 'audit' | 'settings';
+type GlobalField = { name: string; content: string; visibility: 'PUBLIC' | 'INTERNAL' };
 
 export default function App() {
-  const [auth, setAuth] = useState<boolean | null>(null);
-  const [page, setPage] = useState<'courses' | 'keys' | 'audit'>('courses');
-  const [courses, setCourses] = useState<Course[]>([]);
-  const [archived, setArchived] = useState(false);
-  const [query, setQuery] = useState('');
-  const [editing, setEditing] = useState<Course | null>(null);
-  const [importing, setImporting] = useState(false);
-  const [revisions, setRevisions] = useState<Revision[] | null>(null);
-  const [isNew, setIsNew] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState('');
-  const [selectedArchived, setSelectedArchived] = useState<Set<string>>(new Set());
-
+  const [auth, setAuth] = useState<boolean | null>(null); const [page, setPage] = useState<Page>('courses'); const [courses, setCourses] = useState<Course[]>([]); const [archived, setArchived] = useState(false); const [query, setQuery] = useState(''); const [editing, setEditing] = useState<Course | null>(null); const [importing, setImporting] = useState(false); const [revisions, setRevisions] = useState<Revision[] | null>(null); const [isNew, setIsNew] = useState(false); const [busy, setBusy] = useState(false); const [error, setError] = useState(''); const [selectedArchived, setSelectedArchived] = useState<Set<string>>(new Set()); const [globalFields, setGlobalFields] = useState<GlobalField[]>([]);
   useEffect(() => { api('/auth/session').then(() => setAuth(true)).catch(() => setAuth(false)); }, []);
-
-  async function load() {
-    try { setCourses(await api<Course[]>(`/admin/courses?archived=${archived}`)); }
-    catch (caught) { setError(caught instanceof Error ? caught.message : 'Could not load courses'); }
-  }
-
+  async function load() { try { setCourses(await api<Course[]>(`/admin/courses?archived=${archived}`)); } catch (caught) { setError(caught instanceof Error ? caught.message : 'Could not load courses'); } }
   useEffect(() => { if (auth && page === 'courses') load(); }, [auth, archived, page]);
   const shown = useMemo(() => courses.filter(course => `${course.id} ${course.name} ${course.shortDescription}`.toLowerCase().includes(query.toLowerCase())), [courses, query]);
-
-  async function save() {
-    if (!editing) return;
-    setBusy(true); setError('');
-    try { await api(`/admin/courses${isNew ? '' : `/${editing.id}`}`, { method: isNew ? 'POST' : 'PUT', body: JSON.stringify(editing) }); setEditing(null); load(); }
-    catch (caught) { setError(caught instanceof Error ? caught.message : 'Save failed'); }
-    finally { setBusy(false); }
-  }
-
+  async function save() { if (!editing) return; setBusy(true); setError(''); try { await api(`/admin/courses${isNew ? '' : `/${editing.id}`}`, { method: isNew ? 'POST' : 'PUT', body: JSON.stringify(editing) }); setEditing(null); load(); } catch (caught) { setError(caught instanceof Error ? caught.message : 'Save failed'); } finally { setBusy(false); } }
   async function archiveCourse() { if (!editing) return; await api(`/admin/courses/${editing.id}/archive`, { method: 'POST' }); setEditing(null); load(); }
   async function history() { if (!editing) return; setRevisions(await api<Revision[]>(`/admin/courses/${editing.id}/revisions`)); }
   async function restoreRevision(revisionId: string) { if (!editing) return; await api(`/admin/courses/${editing.id}/revisions/${revisionId}/restore`, { method: 'POST' }); setRevisions(null); setEditing(null); load(); }
-
-  function toggleArchivedCourse(id: string) {
-    setSelectedArchived(previous => {
-      const next = new Set(previous);
-      if (next.has(id)) next.delete(id); else next.add(id);
-      return next;
-    });
-  }
-
-  async function restoreSelectedCourses() {
-    if (selectedArchived.size === 0) return;
-    setBusy(true); setError('');
-    try {
-      await Promise.all([...selectedArchived].map(id => api(`/admin/courses/${id}/restore`, { method: 'POST' })));
-      setSelectedArchived(new Set());
-      await load();
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : 'Could not return selected courses');
-    } finally { setBusy(false); }
-  }
-
+  function toggleArchivedCourse(id: string) { setSelectedArchived(previous => { const next = new Set(previous); if (next.has(id)) next.delete(id); else next.add(id); return next; }); }
+  async function restoreSelectedCourses() { if (selectedArchived.size === 0) return; setBusy(true); setError(''); try { await Promise.all([...selectedArchived].map(id => api(`/admin/courses/${id}/restore`, { method: 'POST' }))); setSelectedArchived(new Set()); await load(); } catch (caught) { setError(caught instanceof Error ? caught.message : 'Could not return selected courses'); } finally { setBusy(false); } }
+  async function startNewCourse() { setEditing(emptyCourse()); setIsNew(true); setError(''); try { const templates = await api<GlobalField[]>('/admin/global-fields'); setGlobalFields(templates); setEditing({ ...emptyCourse(), customFields: templates.map(({ name, content, visibility }) => ({ name, content, visibility })) }); } catch (caught) { setError(caught instanceof Error ? caught.message : 'Could not load global fields'); } }
+  function applyGlobalFields(course: Course) { const existing = new Set(course.customFields.map(field => field.name.trim().toLocaleLowerCase())); return { ...course, customFields: [...course.customFields, ...globalFields.filter(field => !existing.has(field.name.trim().toLocaleLowerCase())).map(({ name, content, visibility }) => ({ name, content, visibility }))] }; }
   async function logout() { await api('/auth/logout', { method: 'POST' }); setAuth(false); }
-  const showPage = (next: 'courses' | 'keys' | 'audit', nextArchived = false) => { setPage(next); setArchived(nextArchived); setEditing(null); setImporting(false); setSelectedArchived(new Set()); };
-
+  const showPage = (next: Page, nextArchived = false) => { setPage(next); setArchived(nextArchived); setEditing(null); setImporting(false); setSelectedArchived(new Set()); };
   if (auth === null) return <div className="loading"><img src="/assets/mustaner-logo.webp" alt="Mustaner" /><span>Loading workspace…</span></div>;
   if (!auth) return <Login onSuccess={() => setAuth(true)} />;
-
-  return <div className="app-shell"><aside className="app-sidebar"><div className="logo-lockup"><img className="brand-logo" src="/assets/mustaner-logo.webp" alt="Mustaner" /><small>Course intelligence</small></div><nav aria-label="Workspace"><button className={page === 'courses' && !archived ? 'active' : ''} onClick={() => showPage('courses')}><BookOpen /> <span>Courses</span></button><button className={page === 'keys' ? 'active' : ''} onClick={() => showPage('keys')}><KeyRound /> <span>API access</span></button><button className={page === 'audit' ? 'active' : ''} onClick={() => showPage('audit')}><ShieldCheck /> <span>Audit log</span></button><button className={page === 'courses' && archived ? 'active' : ''} onClick={() => showPage('courses', !archived)}><Archive /> <span>{archived ? 'View active' : 'View archive'}</span></button></nav><div className="sidebar-foot"><span>Mustaner internal</span><button className="logout" onClick={logout}><LogOut /> <span>Sign out</span></button></div></aside><main className="content">{error && <div className="error banner">{error}<button aria-label="Dismiss error" onClick={() => setError('')}>×</button></div>}
-    {importing ? <section className="pdf-import-page"><div className="page-head"><div><p className="eyebrow">Course import</p><h1>Import from PDF</h1><p>Upload a course document and let AI prepare the details for review.</p></div><div className="head-actions"><label className="secondary" htmlFor="course-pdf"><FileUp size={16} /> Choose file</label><button className="secondary" onClick={() => setImporting(false)}>Cancel</button></div></div><PdfImport focused onImport={course => { setEditing(course); setIsNew(true); setImporting(false); }} /></section> : editing ? <CourseEditor course={editing} isNew={isNew} onChange={setEditing} onSave={save} onClose={() => setEditing(null)} onArchive={isNew ? undefined : archiveCourse} onHistory={isNew ? undefined : history} busy={busy} /> : <>
-      {page === 'courses' && <CourseLibrary archived={archived} shown={shown} query={query} busy={busy} selectedArchived={selectedArchived} onQueryChange={setQuery} onImport={() => setImporting(true)} onNew={() => { setEditing(emptyCourse()); setIsNew(true); }} onEdit={course => { setEditing(course); setIsNew(false); }} onToggle={toggleArchivedCourse} onSelectAll={checked => setSelectedArchived(checked ? new Set(shown.map(course => course.id)) : new Set())} onRestore={restoreSelectedCourses} />}
-      {page === 'keys' && <ApiKeys />}{page === 'audit' && <Audit />}
-    </>}
-    {revisions && editing && <RevisionPanel revisions={revisions} onRestore={restoreRevision} onClose={() => setRevisions(null)} />}
-  </main></div>;
+  return <div className="app-shell"><aside className="app-sidebar"><div className="logo-lockup"><img className="brand-logo" src="/assets/mustaner-logo.webp" alt="Mustaner" /><small>Course intelligence</small></div><nav aria-label="Workspace"><button className={page === 'courses' && !archived ? 'active' : ''} onClick={() => showPage('courses')}><BookOpen /> <span>Courses</span></button><button className={page === 'keys' ? 'active' : ''} onClick={() => showPage('keys')}><KeyRound /> <span>API access</span></button><button className={page === 'audit' ? 'active' : ''} onClick={() => showPage('audit')}><ShieldCheck /> <span>Audit log</span></button><button className={page === 'settings' ? 'active' : ''} onClick={() => showPage('settings')}><SettingsIcon /> <span>Settings</span></button><button className={page === 'courses' && archived ? 'active' : ''} onClick={() => showPage('courses', !archived)}><Archive /> <span>{archived ? 'View active' : 'View archive'}</span></button></nav><div className="sidebar-foot"><span>Mustaner internal</span><button className="logout" onClick={logout}><LogOut /> <span>Sign out</span></button></div></aside><main className="content">{error && <div className="error banner">{error}<button aria-label="Dismiss error" onClick={() => setError('')}>×</button></div>}{importing ? <section className="pdf-import-page"><div className="page-head"><div><p className="eyebrow">Course import</p><h1>Import from PDF</h1><p>Upload a course document and let AI prepare the details for review.</p></div><div className="head-actions"><label className="secondary" htmlFor="course-pdf"><FileUp size={16} /> Choose file</label><button className="secondary" onClick={() => setImporting(false)}>Cancel</button></div></div><PdfImport focused onImport={course => { setEditing(applyGlobalFields(course)); setIsNew(true); setImporting(false); }} /></section> : editing ? <CourseEditor course={editing} isNew={isNew} onChange={setEditing} onSave={save} onClose={() => setEditing(null)} onArchive={isNew ? undefined : archiveCourse} onHistory={isNew ? undefined : history} busy={busy} /> : <>{page === 'courses' && <CourseLibrary archived={archived} shown={shown} query={query} busy={busy} selectedArchived={selectedArchived} onQueryChange={setQuery} onImport={() => setImporting(true)} onNew={startNewCourse} onEdit={course => { setEditing(course); setIsNew(false); }} onToggle={toggleArchivedCourse} onSelectAll={checked => setSelectedArchived(checked ? new Set(shown.map(course => course.id)) : new Set())} onRestore={restoreSelectedCourses} />}{page === 'keys' && <ApiKeys />}{page === 'audit' && <Audit />}{page === 'settings' && <Settings />}</>}{revisions && editing && <RevisionPanel revisions={revisions} onRestore={restoreRevision} onClose={() => setRevisions(null)} />}</main></div>;
 }
 
-function CourseLibrary({ archived, shown, query, busy, selectedArchived, onQueryChange, onImport, onNew, onEdit, onToggle, onSelectAll, onRestore }: { archived: boolean; shown: Course[]; query: string; busy: boolean; selectedArchived: Set<string>; onQueryChange: (value: string) => void; onImport: () => void; onNew: () => void; onEdit: (course: Course) => void; onToggle: (id: string) => void; onSelectAll: (checked: boolean) => void; onRestore: () => void; }) {
-  const allShownSelected = shown.length > 0 && shown.every(course => selectedArchived.has(course.id));
-  return <section><div className="page-head"><div><p className="eyebrow">Sales knowledge base</p><h1>{archived ? 'Archived courses' : 'Course library'}</h1><p>Manage what your sales agent knows and how it communicates value.</p></div><div className="head-actions">{archived ? <button className="primary" disabled={busy || selectedArchived.size === 0} onClick={onRestore}><RotateCcw size={16} /> Return to Course</button> : <><button className="secondary" onClick={onImport}><FileUp size={16} /> Import from PDF</button><button className="primary" onClick={onNew}><Plus size={16} /> New course</button></>}</div></div><div className="toolbar"><div className="search"><Search size={18} /><input aria-label="Search courses" placeholder="Search by ID, name, or description" value={query} onChange={event => onQueryChange(event.target.value)} /></div><span>{shown.length} {shown.length === 1 ? 'course' : 'courses'}</span></div>
-    {shown.length > 0 ? <div className="course-list"><div className={`course-list-head ${archived ? 'archive-list-head' : ''}`}>{archived && <label className="course-select"><input type="checkbox" aria-label="Select all archived courses" checked={allShownSelected} onChange={event => onSelectAll(event.target.checked)} /></label>}<span>Course</span><span>ID</span><span>Knowledge</span><span>Status</span></div>{shown.map(course => archived ? <div className="course-row archive-select-row" key={course.id}><label className="course-select"><input type="checkbox" aria-label={`Select ${course.name}`} checked={selectedArchived.has(course.id)} onChange={() => onToggle(course.id)} /></label><CourseRowContent course={course} /></div> : <button className="course-row" key={course.id} onClick={() => onEdit(course)}><CourseRowContent course={course} /></button>)}</div> : <div className="illustrated-empty course-empty"><img src="/assets/empty-courses.png" alt="Two professionals building a course from structured learning content" /><div><p className="eyebrow">Start the knowledge base</p><h2>{archived ? 'No archived courses' : 'Build your first course'}</h2><p>{archived ? 'Courses you archive will remain safely available here.' : 'Add the curriculum, price, sales guidance, and custom knowledge your agent needs.'}</p>{!archived && <button className="primary" onClick={onNew}><Plus size={16} /> Create a course</button>}</div></div>}
-  </section>;
-}
+function CourseLibrary({ archived, shown, query, busy, selectedArchived, onQueryChange, onImport, onNew, onEdit, onToggle, onSelectAll, onRestore }: { archived: boolean; shown: Course[]; query: string; busy: boolean; selectedArchived: Set<string>; onQueryChange: (value: string) => void; onImport: () => void; onNew: () => void; onEdit: (course: Course) => void; onToggle: (id: string) => void; onSelectAll: (checked: boolean) => void; onRestore: () => void; }) { const allShownSelected = shown.length > 0 && shown.every(course => selectedArchived.has(course.id)); return <section><div className="page-head"><div><p className="eyebrow">Sales knowledge base</p><h1>{archived ? 'Archived courses' : 'Course library'}</h1><p>Manage what your sales agent knows and how it communicates value.</p></div><div className="head-actions">{archived ? <button className="primary" disabled={busy || selectedArchived.size === 0} onClick={onRestore}><RotateCcw size={16} /> Return to Course</button> : <><button className="secondary" onClick={onImport}><FileUp size={16} /> Import from PDF</button><button className="primary" onClick={onNew}><Plus size={16} /> New course</button></>}</div></div><div className="toolbar"><div className="search"><Search size={18} /><input aria-label="Search courses" placeholder="Search by ID, name, or description" value={query} onChange={event => onQueryChange(event.target.value)} /></div><span>{shown.length} {shown.length === 1 ? 'course' : 'courses'}</span></div>{shown.length > 0 ? <div className="course-list"><div className={`course-list-head ${archived ? 'archive-list-head' : ''}`}>{archived && <label className="course-select"><input type="checkbox" aria-label="Select all archived courses" checked={allShownSelected} onChange={event => onSelectAll(event.target.checked)} /></label>}<span>Course</span><span>ID</span><span>Knowledge</span><span>Status</span></div>{shown.map(course => archived ? <div className="course-row archive-select-row" key={course.id}><label className="course-select"><input type="checkbox" aria-label={`Select ${course.name}`} checked={selectedArchived.has(course.id)} onChange={() => onToggle(course.id)} /></label><CourseRowContent course={course} /></div> : <button className="course-row" key={course.id} onClick={() => onEdit(course)}><CourseRowContent course={course} /></button>)}</div> : <div className="illustrated-empty course-empty"><img src="/assets/empty-courses.png" alt="Two professionals building a course from structured learning content" /><div><p className="eyebrow">Start the knowledge base</p><h2>{archived ? 'No archived courses' : 'Build your first course'}</h2><p>{archived ? 'Courses you archive will remain safely available here.' : 'Add the curriculum, price, sales guidance, and custom knowledge your agent needs.'}</p>{!archived && <button className="primary" onClick={onNew}><Plus size={16} /> Create a course</button>}</div></div>}</section>; }
 
 function CourseRowContent({ course }: { course: Course }) { return <><span className="course-name"><strong dir="auto">{course.name}</strong><small dir="auto">{course.shortDescription || 'No short description yet.'}</small></span><code>#{course.id}</code><span className="knowledge-count">{course.customFields.length} fields · {course.mediaLinks.length} media</span><span className={`status ${course.status.toLowerCase()}`}>{course.status.toLowerCase()}</span></>; }
-
 function Audit() { const [items, setItems] = useState<Array<{ id: string; action: string; entityType: string; entityId?: string; createdAt: string }>>([]); useEffect(() => { api<typeof items>('/admin/audit').then(setItems); }, []); return <section><div className="page-head"><div><p className="eyebrow">Accountability</p><h1>Audit log</h1><p>A chronological record of catalog and credential changes.</p></div></div><div className="table-card"><table><thead><tr><th>Event</th><th>Entity</th><th>Date</th></tr></thead><tbody>{items.map(item => <tr key={item.id}><td><strong>{item.action}</strong></td><td>{item.entityType} {item.entityId && <code>#{item.entityId}</code>}</td><td>{new Date(item.createdAt).toLocaleString()}</td></tr>)}</tbody></table></div></section>; }
