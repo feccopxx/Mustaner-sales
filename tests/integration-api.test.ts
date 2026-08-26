@@ -63,7 +63,7 @@ describe('integration API', () => {
   });
 
   it('delivers a ready batch through Messenger', async () => {
-    prismaMock.agentMessageBatch.findUnique.mockResolvedValue({ id: 'batch-1', status: 'READY_TO_SEND', responseText: 'أهلاً يا فندم', conversationId: 'conversation-1', conversation: { channel: 'MESSENGER', customerId: 'lead-1', lastInboundAt: new Date('2026-08-26T12:00:00Z') }, messages: [{ receivedAt: new Date('2026-08-26T12:00:00Z') }] });
+    prismaMock.agentMessageBatch.findUnique.mockResolvedValue({ id: 'batch-1', status: 'READY_TO_SEND', responseText: 'أهلاً يا فندم', conversationId: 'conversation-1', conversation: { channel: 'MESSENGER', customerId: 'lead-1', lastInboundAt: new Date('2026-08-26T12:00:00Z'), lastInboundSequence: 1 }, messages: [{ receivedAt: new Date('2026-08-26T12:00:00Z'), sequence: 1 }] });
     prismaMock.agentMessageBatch.updateMany.mockResolvedValue({ count: 1 });
     const { app } = await import('../server/app.js');
     const response = await request(app).post('/api/v1/agent/batches/batch-1/send').set('X-API-Key', 'mstr_test');
@@ -71,7 +71,8 @@ describe('integration API', () => {
   });
 
   it('does not deliver a reply after newer customer input arrives', async () => {
-    prismaMock.agentMessageBatch.findUnique.mockResolvedValue({ id: 'batch-1', status: 'READY_TO_SEND', responseText: 'old reply', conversationId: 'conversation-1', conversation: { channel: 'MESSENGER', customerId: 'lead-1', lastInboundAt: new Date('2026-08-26T12:01:00Z') }, messages: [{ receivedAt: new Date('2026-08-26T12:00:00Z') }] });
+    prismaMock.agentMessageBatch.findUnique.mockResolvedValue({ id: 'batch-1', status: 'READY_TO_SEND', responseText: 'old reply', conversationId: 'conversation-1', conversation: { channel: 'MESSENGER', customerId: 'lead-1', lastInboundAt: new Date('2026-08-26T12:00:00Z'), lastInboundSequence: 2 }, messages: [{ receivedAt: new Date('2026-08-26T12:00:00Z'), sequence: 1 }] });
+    prismaMock.agentMessageBatch.updateMany.mockResolvedValue({ count: 1 });
     const { app } = await import('../server/app.js');
     const response = await request(app).post('/api/v1/agent/batches/batch-1/send').set('X-API-Key', 'mstr_test');
     expect(response.status).toBe(409); expect(sendMessengerText).not.toHaveBeenCalled();

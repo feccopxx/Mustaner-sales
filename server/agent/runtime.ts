@@ -11,7 +11,7 @@ export interface SalesAiClient {
 }
 
 export function createSalesAiClient(apiKey: string): SalesAiClient {
-  const client = new OpenAI({ apiKey });
+  const client = new OpenAI({ apiKey, timeout: 120_000, maxRetries: 1 });
   return { create: async request => {
     const response = await client.responses.create(request as never);
     return response as { output_text: string };

@@ -238,16 +238,17 @@ const persistInboundMessage = async (input: PersistedInbound) => {
     if (conversation) {
       const duplicate = await tx.agentMessage.findUnique({ where: { conversationId_sourceMessageId: { conversationId: conversation.id, sourceMessageId: input.sourceMessageId } } });
       if (duplicate) return { duplicate: true as const };
-      await tx.agentMessageBatch.updateMany({ where: { conversationId: conversation.id, status: 'READY_TO_SEND', deliveryStatus: 'PENDING' }, data: { status: 'SUPERSEDED' } });
-      conversation = await tx.agentConversation.update({ where: { id: conversation.id }, data: { lastInboundAt: receivedAt } });
-    } else conversation = await tx.agentConversation.create({ data: { channel: input.channel, customerId: input.customerId, state: {}, lastInboundAt: receivedAt } });
+      await tx.agentMessageBatch.updateMany({ where: { conversationId: conversation.id, status: { in: ['PROCESSING', 'GENERATING', 'READY_TO_SEND'] } }, data: { status: 'SUPERSEDED' } });
+      const sequence = (conversation.inboundSequence || 0) + 1;
+      conversation = await tx.agentConversation.update({ where: { id: conversation.id }, data: { lastInboundAt: receivedAt, inboundSequence: sequence, lastInboundSequence: sequence } });
+    } else conversation = await tx.agentConversation.create({ data: { channel: input.channel, customerId: input.customerId, state: {}, lastInboundAt: receivedAt, inboundSequence: 1, lastInboundSequence: 1 } });
     const duplicate = await tx.agentMessage.findUnique({ where: { conversationId_sourceMessageId: { conversationId: conversation.id, sourceMessageId: input.sourceMessageId } } });
     if (duplicate) return { duplicate: true as const };
     await tx.agentFollowUp.updateMany({ where: { conversationId: conversation.id, status: 'PENDING' }, data: { status: 'CANCELLED' } });
     const flushAt = nextBatchFlushAt(receivedAt);
     let batch = await tx.agentMessageBatch.findFirst({ where: { conversationId: conversation.id, status: 'OPEN' }, orderBy: { createdAt: 'desc' } });
     batch = batch ? await tx.agentMessageBatch.update({ where: { id: batch.id }, data: { flushAt } }) : await tx.agentMessageBatch.create({ data: { conversationId: conversation.id, flushAt } });
-    await tx.agentMessage.create({ data: { conversationId: conversation.id, batchId: batch.id, sourceMessageId: input.sourceMessageId, kind: input.kind, normalizedText: input.mediaUrl ? '' : normalizeInboundMessage({ id: input.sourceMessageId, kind: input.kind, text: input.text, occurredAt }), occurredAt, receivedAt, mediaUrl: input.mediaUrl, mediaStatus: input.mediaUrl ? 'PENDING' : 'READY' } });
+    await tx.agentMessage.create({ data: { conversationId: conversation.id, batchId: batch.id, sourceMessageId: input.sourceMessageId, kind: input.kind, normalizedText: input.mediaUrl ? '' : normalizeInboundMessage({ id: input.sourceMessageId, kind: input.kind, text: input.text, occurredAt }), occurredAt, receivedAt, sequence: conversation.lastInboundSequence || 1, mediaUrl: input.mediaUrl, mediaStatus: input.mediaUrl ? 'PENDING' : 'READY' } });
     return { duplicate: false as const, batch };
   });
 };
@@ -304,6 +305,89 @@ app.post('/api/v1/agent/messages', apiAuth, requireApiScope('agent:write'), asyn
     throw error;
   }
 });
+
+export async function processPendingAgentBatches(limit = 4): Promise<number> {
+  const apiKey = process.env.OPEN_AI_API_KEY;
+  if (!apiKey) return 0;
+  let processed = 0;
+  for (let index = 0; index < limit; index++) {
+    const now = new Date();
+    await prisma.agentMessageBatch.updateMany({ where: { status: 'GENERATING', generationStartedAt: { lte: new Date(now.getTime() - 5 * 60_000) } }, data: { status: 'OPEN', generationStartedAt: null, generationToken: null, flushAt: now } });
+    const batch = await prisma.$transaction(async tx => {
+      const candidate = await tx.agentMessageBatch.findFirst({ where: { status: 'OPEN', flushAt: { lte: now }, messages: { none: { mediaStatus: { in: ['PENDING', 'PROCESSING'] } } } }, include: { conversation: true }, orderBy: { flushAt: 'asc' } });
+      if (!candidate) return null;
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`${candidate.conversation.channel}:${candidate.conversation.customerId}`}))`;
+      const current = await tx.agentMessageBatch.findUnique({ where: { id: candidate.id }, include: { conversation: true, messages: { orderBy: [{ occurredAt: 'asc' }, { receivedAt: 'asc' }, { id: 'asc' }] } } });
+      if (!current || current.status !== 'OPEN' || current.flushAt > now) return null;
+      const won = await tx.agentMessageBatch.updateMany({ where: { id: current.id, status: 'OPEN' }, data: { status: 'PROCESSING' } });
+      if (won.count !== 1) return null;
+      const customerInput = current.messages.map(message => message.normalizedText).filter(Boolean).join('\n');
+      await tx.agentMessageBatch.update({ where: { id: current.id }, data: { combinedInput: customerInput } });
+      return { ...current, combinedInput: customerInput, status: 'PROCESSING' as const };
+    });
+    if (!batch) break;
+    const published = await prisma.agentConfigurationVersion.findFirst({ orderBy: { version: 'desc' } });
+    if (!published) { await prisma.agentMessageBatch.update({ where: { id: batch.id }, data: { status: 'OPEN' } }); break; }
+    const generationToken = randomUUID();
+    const claim = await prisma.agentMessageBatch.updateMany({ where: { id: batch.id, status: 'PROCESSING' }, data: { status: 'GENERATING', generationToken, generationStartedAt: new Date() } });
+    if (claim.count !== 1) continue;
+    try {
+      const courses = await prisma.course.findMany({ where: { status: 'PUBLISHED', archivedAt: null }, select: { id: true, name: true, shortDescription: true } });
+      const reply = await generateSalesReply({ persona: published.persona, configurationVersion: published.version, customerInput: batch.combinedInput, conversationState: batch.conversation.state as Record<string, unknown>, verifiedContext: { courseCatalog: courses } }, createSalesAiClient(apiKey));
+      const completed = await prisma.agentMessageBatch.updateMany({ where: { id: batch.id, status: 'GENERATING', generationToken }, data: { status: 'READY_TO_SEND', responseText: reply, configurationVersion: published.version, generationStartedAt: null, generationToken: null, deliveryStatus: 'PENDING', deliveryStartedAt: null, deliveryToken: null } });
+      if (completed.count === 1) processed++;
+    } catch {
+      await prisma.agentMessageBatch.updateMany({ where: { id: batch.id, status: 'GENERATING', generationToken }, data: { status: 'OPEN', generationStartedAt: null, generationToken: null, flushAt: nextBatchFlushAt(new Date()) } });
+    }
+  }
+  return processed;
+}
+
+export async function processPendingMessengerDeliveries(limit = 4): Promise<number> {
+  const token = process.env.MESSENGER_PAGE_ACCESS_TOKEN;
+  if (!token) return 0;
+  let delivered = 0;
+  for (let index = 0; index < limit; index++) {
+    const candidate = await prisma.agentMessageBatch.findFirst({ where: { status: 'READY_TO_SEND', deliveryStatus: 'PENDING', conversation: { channel: 'MESSENGER' } }, include: { conversation: true }, orderBy: { createdAt: 'asc' } });
+    if (!candidate) break;
+    const deliveryToken = randomUUID();
+    const batch = await prisma.$transaction(async tx => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`${candidate.conversation.channel}:${candidate.conversation.customerId}`}))`;
+      const current = await tx.agentMessageBatch.findUnique({ where: { id: candidate.id }, include: { conversation: true, messages: { orderBy: { receivedAt: 'desc' }, take: 1 } } });
+      if (!current || current.status !== 'READY_TO_SEND' || current.deliveryStatus !== 'PENDING' || !current.responseText) return null;
+      const latest = current.messages[0]?.sequence;
+      if (!latest || current.conversation.lastInboundSequence !== latest) return null;
+      const won = await tx.agentMessageBatch.updateMany({ where: { id: current.id, status: 'READY_TO_SEND', deliveryStatus: 'PENDING' }, data: { deliveryStatus: 'SENDING', deliveryStartedAt: new Date(), deliveryToken } });
+      return won.count === 1 ? current : null;
+    });
+    if (!batch) continue;
+    try {
+      const finalized = await prisma.$transaction(async tx => {
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`${batch.conversation.channel}:${batch.conversation.customerId}`}))`;
+        const current = await tx.agentMessageBatch.findUnique({ where: { id: batch.id }, include: { conversation: true, messages: { orderBy: { receivedAt: 'desc' }, take: 1 } } });
+        if (!current) return false;
+        const latest = current.messages[0]?.sequence;
+        if (!latest || current.conversation.lastInboundSequence !== latest) {
+          await tx.agentMessageBatch.updateMany({ where: { id: batch.id, status: 'READY_TO_SEND', deliveryStatus: 'SENDING', deliveryToken }, data: { status: 'SUPERSEDED', deliveryStatus: 'PENDING', deliveryStartedAt: null, deliveryToken: null } });
+          return false;
+        }
+        await sendMessengerText(current.conversation.customerId, current.responseText, token);
+        const won = await tx.agentMessageBatch.updateMany({ where: { id: batch.id, status: 'READY_TO_SEND', deliveryStatus: 'SENDING', deliveryToken }, data: { status: 'PROCESSED', processedAt: new Date(), deliveredAt: new Date(), deliveryStatus: 'DELIVERED', deliveryStartedAt: null, deliveryToken: null } });
+        if (won.count !== 1) return false;
+        if (latest && current.conversation.lastInboundSequence === latest && current.conversation.lastInboundAt) {
+          const [first, second] = scheduleFollowUps(current.conversation.lastInboundAt);
+          for (const [stage, dueAt] of [[1, first], [2, second]] as const) await tx.agentFollowUp.upsert({ where: { conversationId_stage: { conversationId: current.conversationId, stage } }, create: { conversationId: current.conversationId, stage, dueAt }, update: { dueAt, status: 'PENDING' } });
+        }
+        return true;
+      });
+      if (finalized) delivered++;
+    } catch {
+      await prisma.agentMessageBatch.updateMany({ where: { id: batch.id, deliveryStatus: 'SENDING', deliveryToken }, data: { deliveryStatus: 'AMBIGUOUS' } });
+    }
+  }
+  return delivered;
+}
+
 app.post('/api/v1/agent/batches/claim', apiAuth, requireApiScope('agent:write'), async (req, res) => {
   const parsed = agentBatchClaimSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: 'Invalid batch claim', issues: parsed.error.issues });
@@ -341,8 +425,8 @@ app.post('/api/v1/agent/batches/:id/send', apiAuth, requireApiScope('agent:write
     if (batch.status !== 'READY_TO_SEND' || !batch.responseText) return { status: 'NOT_READY' as const };
     if (batch.deliveryStatus === 'SENDING' || batch.deliveryStatus === 'AMBIGUOUS') return { status: 'AMBIGUOUS' as const };
     if (batch.conversation.channel !== 'MESSENGER') return { status: 'UNSUPPORTED_CHANNEL' as const };
-    const batchLatest = batch.messages[0]?.receivedAt;
-    if (!batchLatest || batch.conversation.lastInboundAt?.getTime() !== batchLatest.getTime()) return { status: 'STALE' as const };
+    const batchLatest = batch.messages[0]?.sequence;
+    if (!batchLatest || batch.conversation.lastInboundSequence !== batchLatest) return { status: 'STALE' as const };
     const won = await tx.agentMessageBatch.updateMany({ where: { id: batch.id, status: 'READY_TO_SEND', deliveryStatus: 'PENDING' }, data: { deliveryStatus: 'SENDING', deliveryStartedAt: new Date(), deliveryToken } });
     if (won.count !== 1) return { status: 'AMBIGUOUS' as const };
     return { status: 'CLAIMED' as const, batch };
@@ -355,32 +439,36 @@ app.post('/api/v1/agent/batches/:id/send', apiAuth, requireApiScope('agent:write
   if (claim.status === 'UNSUPPORTED_CHANNEL') return res.status(400).json({ error: 'Unsupported delivery channel' });
   const { batch } = claim;
   try {
-    await sendMessengerText(batch.conversation.customerId, batch.responseText, pageAccessToken);
+    const finalized = await prisma.$transaction(async tx => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`${batch.conversation.channel}:${batch.conversation.customerId}`}))`;
+      const fresh = await tx.agentMessageBatch.findUnique({ where: { id: batch.id }, include: { conversation: true, messages: { orderBy: { receivedAt: 'desc' }, take: 1 } } });
+      if (!fresh) return false;
+      const batchLatest = fresh.messages[0]?.sequence;
+      if (!batchLatest || fresh.conversation.lastInboundSequence !== batchLatest) {
+        await tx.agentMessageBatch.updateMany({ where: { id: batch.id, status: 'READY_TO_SEND', deliveryStatus: 'SENDING', deliveryToken }, data: { status: 'SUPERSEDED', deliveryStatus: 'PENDING', deliveryStartedAt: null, deliveryToken: null } });
+        return false;
+      }
+      await sendMessengerText(fresh.conversation.customerId, fresh.responseText, pageAccessToken);
+      const deliveredAt = new Date();
+      const won = await tx.agentMessageBatch.updateMany({ where: { id: batch.id, status: 'READY_TO_SEND', deliveryStatus: 'SENDING', deliveryToken }, data: { status: 'PROCESSED', processedAt: deliveredAt, deliveredAt, deliveryStatus: 'DELIVERED', deliveryStartedAt: null, deliveryToken: null } });
+      if (won.count !== 1) return false;
+      if (fresh.conversation.lastInboundAt) {
+        const [first, second] = scheduleFollowUps(fresh.conversation.lastInboundAt);
+        for (const [stage, dueAt] of [[1, first], [2, second]] as const) await tx.agentFollowUp.upsert({ where: { conversationId_stage: { conversationId: fresh.conversationId, stage } }, create: { conversationId: fresh.conversationId, stage, dueAt }, update: { dueAt, status: 'PENDING' } });
+      }
+      return true;
+    });
+    if (!finalized) return res.status(409).json({ error: 'Messenger delivery requires reconciliation' });
+    res.json({ status: 'DELIVERED' });
   } catch (error) {
     await prisma.agentMessageBatch.updateMany({ where: { id: batch.id, deliveryStatus: 'SENDING', deliveryToken }, data: { deliveryStatus: 'AMBIGUOUS' } });
     throw error;
   }
-  const finalized = await prisma.$transaction(async tx => {
-    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`${batch.conversation.channel}:${batch.conversation.customerId}`}))`;
-    const fresh = await tx.agentMessageBatch.findUnique({ where: { id: batch.id }, include: { conversation: true, messages: { orderBy: { receivedAt: 'desc' }, take: 1 } } });
-    if (!fresh) return false;
-    const deliveredAt = new Date();
-    const won = await tx.agentMessageBatch.updateMany({ where: { id: batch.id, status: 'READY_TO_SEND', deliveryStatus: 'SENDING', deliveryToken }, data: { status: 'PROCESSED', processedAt: deliveredAt, deliveredAt, deliveryStatus: 'DELIVERED', deliveryStartedAt: null, deliveryToken: null } });
-    if (won.count !== 1) return false;
-    const batchLatest = fresh.messages[0]?.receivedAt;
-    if (batchLatest && fresh.conversation.lastInboundAt?.getTime() === batchLatest.getTime()) {
-      const [first, second] = scheduleFollowUps(fresh.conversation.lastInboundAt);
-      for (const [stage, dueAt] of [[1, first], [2, second]] as const) await tx.agentFollowUp.upsert({ where: { conversationId_stage: { conversationId: fresh.conversationId, stage } }, create: { conversationId: fresh.conversationId, stage, dueAt }, update: { dueAt, status: 'PENDING' } });
-    }
-    return true;
-  });
-  if (!finalized) return res.status(409).json({ error: 'Messenger delivery requires reconciliation' });
-  res.json({ status: 'DELIVERED' });
 });
 app.post('/api/v1/agent/batches/:id/reconcile-delivery', apiAuth, requireApiScope('agent:write'), async (req, res) => {
   const parsed = agentDeliveryReconcileSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: 'Invalid delivery reconciliation', issues: parsed.error.issues });
-  const result = await prisma.agentMessageBatch.updateMany({ where: { id: param(req.params.id), status: 'READY_TO_SEND', OR: [{ deliveryStatus: 'AMBIGUOUS' }, { deliveryStatus: 'SENDING', deliveryStartedAt: { lte: new Date(Date.now() - 60_000) } }] }, data: { deliveryStatus: 'PENDING', deliveryStartedAt: null, deliveryToken: null } });
+  const result = await prisma.agentMessageBatch.updateMany({ where: { id: param(req.params.id), status: 'READY_TO_SEND', deliveryStatus: 'AMBIGUOUS' }, data: { deliveryStatus: 'PENDING', deliveryStartedAt: null, deliveryToken: null } });
   if (result.count !== 1) return res.status(409).json({ error: 'Delivery is not awaiting reconciliation' });
   res.json({ status: 'PENDING' });
 });
@@ -395,8 +483,8 @@ app.post('/api/v1/agent/batches/:id/delivered', apiAuth, requireApiScope('agent:
     const deliveredAt = new Date();
     const won = await tx.agentMessageBatch.updateMany({ where: { id: batchId, status: 'READY_TO_SEND' }, data: { status: 'PROCESSED', processedAt: deliveredAt, deliveredAt, deliveryStatus: 'DELIVERED', deliveryStartedAt: null } });
     if (won.count !== 1) return;
-    const batchLatest = batch.messages[0]?.receivedAt;
-    if (!batchLatest || !batch.conversation.lastInboundAt || batch.conversation.lastInboundAt.getTime() !== batchLatest.getTime()) return;
+    const batchLatest = batch.messages[0]?.sequence;
+    if (!batchLatest || !batch.conversation.lastInboundAt || batch.conversation.lastInboundSequence !== batchLatest) return;
     const [first, second] = scheduleFollowUps(batch.conversation.lastInboundAt);
     for (const [stage, dueAt] of [[1, first], [2, second]] as const) await tx.agentFollowUp.upsert({ where: { conversationId_stage: { conversationId: batch.conversationId, stage } }, create: { conversationId: batch.conversationId, stage, dueAt }, update: { dueAt, status: 'PENDING' } });
   });

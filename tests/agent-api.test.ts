@@ -107,7 +107,7 @@ describe('sales agent API', () => {
   });
 
   it('marks a stored response delivered exactly once', async () => {
-    prismaMock.agentMessageBatch.findUnique.mockResolvedValue({ id: 'batch-1', status: 'READY_TO_SEND', conversationId: 'conversation-1', conversation: { channel: 'MESSENGER', customerId: 'customer-1', lastInboundAt: new Date('2026-08-26T12:00:00Z') }, messages: [{ receivedAt: new Date('2026-08-26T12:00:00Z') }] });
+    prismaMock.agentMessageBatch.findUnique.mockResolvedValue({ id: 'batch-1', status: 'READY_TO_SEND', conversationId: 'conversation-1', conversation: { channel: 'MESSENGER', customerId: 'customer-1', lastInboundAt: new Date('2026-08-26T12:00:00Z'), lastInboundSequence: 1 }, messages: [{ receivedAt: new Date('2026-08-26T12:00:00Z'), sequence: 1 }] });
     prismaMock.agentMessageBatch.updateMany.mockResolvedValue({ count: 1 });
     const { app } = await import('../server/app.js');
     const response = await request(app).post('/api/v1/agent/batches/batch-1/delivered').set('X-API-Key', 'mstr_test');

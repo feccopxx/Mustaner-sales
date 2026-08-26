@@ -151,6 +151,8 @@ model AgentConversation {
   customerId    String
   state         Json
   lastInboundAt DateTime?
+  inboundSequence Int      @default(0)
+  lastInboundSequence Int  @default(0)
   createdAt     DateTime         @default(now())
   updatedAt     DateTime         @updatedAt
   messages      AgentMessage[]
@@ -167,6 +169,7 @@ model AgentMessage {
   normalizedText  String            @db.Text
   occurredAt      DateTime
   receivedAt      DateTime
+  sequence        Int
   mediaUrl        String?           @db.Text
   mediaStatus     String            @default("READY")
   mediaStartedAt  DateTime?
@@ -181,6 +184,7 @@ model AgentMessage {
 
   @@unique([conversationId, sourceMessageId])
   @@index([conversationId, occurredAt])
+  @@index([conversationId, sequence])
   @@index([mediaStatus, receivedAt])
 }
 
