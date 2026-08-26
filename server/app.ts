@@ -1,16 +1,21 @@
 import express from 'express';
+import type { Prisma } from '@prisma/client';
 import cookieParser from 'cookie-parser';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { prisma } from './prisma.js';
-import { courseInputSchema, globalFieldInputSchema } from './domain.js';
+import { agentConfigurationDraftSchema, agentHandoffInputSchema, agentMeetingInputSchema, agentResponseInputSchema, courseInputSchema, globalFieldInputSchema } from './domain.js';
 import { createApiKey, hashPassword, synchronizePasswordHash, verifyApiKey, verifyPassword } from './security.js';
 import { csrfGuard, issueSession, newCsrfToken, requireAdmin } from './auth.js';
 import { projectCourse } from './course-projection.js';
 import multer from 'multer';
 import { createPdfAiClient, extractPdfCourseDraft, validatePdfUpload } from './pdf-import.js';
+import { reserveMeeting } from './agent/booking.js';
+import { createHandoffEvent } from './agent/handoff.js';
+import { createSalesAiClient, generateSalesReply } from './agent/runtime.js';
+import { publishAgentConfiguration } from './agent/configuration.js';
 
 const include = { customFields: true, mediaLinks: true } as const;
 const param = (value: string | string[]) => Array.isArray(value) ? value[0] : value;
@@ -93,6 +98,27 @@ app.delete('/api/admin/global-fields/:id', requireAdmin, async (req, res) => {
     res.status(204).end();
   } catch { res.status(404).json({ error: 'Global field not found' }); }
 });
+app.get('/api/admin/agent-config/draft', requireAdmin, async (_req, res) => {
+  const draft = await prisma.agentConfigurationDraft.findUnique({ where: { id: 'current' } });
+  res.json(draft || { id: 'current', persona: '' });
+});
+app.put('/api/admin/agent-config/draft', requireAdmin, async (req, res) => {
+  const parsed = agentConfigurationDraftSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'Invalid agent configuration', issues: parsed.error.issues });
+  const draft = await prisma.agentConfigurationDraft.upsert({ where: { id: 'current' }, create: { id: 'current', ...parsed.data }, update: parsed.data });
+  await prisma.auditLog.create({ data: { action: 'agent_config.draft_updated', entityType: 'agent_configuration', entityId: draft.id } });
+  res.json(draft);
+});
+app.post('/api/admin/agent-config/publish', requireAdmin, async (_req, res) => {
+  const draft = await prisma.agentConfigurationDraft.findUnique({ where: { id: 'current' } });
+  if (!draft?.persona.trim()) return res.status(409).json({ error: 'Agent configuration draft is empty' });
+  const published = await publishAgentConfiguration(draft, {
+    latestVersion: async () => (await prisma.agentConfigurationVersion.aggregate({ _max: { version: true } }))._max.version || 0,
+    publish: input => prisma.agentConfigurationVersion.create({ data: input }),
+  });
+  await prisma.auditLog.create({ data: { action: 'agent_config.published', entityType: 'agent_configuration', entityId: published.id, metadata: { version: published.version } } });
+  res.status(201).json(published);
+});
 app.post('/api/admin/courses/import-pdf', requireAdmin, pdfUpload.single('pdf'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'Choose a PDF file to import' });
   try {
@@ -153,7 +179,7 @@ app.post('/api/admin/courses/:id/revisions/:revisionId/restore', requireAdmin, a
 
 app.get('/api/admin/api-keys', requireAdmin, async (_req, res) => res.json(await prisma.apiKey.findMany({ select: { id: true, name: true, prefix: true, scopes: true, createdAt: true, lastUsedAt: true, revokedAt: true }, orderBy: { createdAt: 'desc' } })));
 app.post('/api/admin/api-keys', requireAdmin, async (req, res) => {
-  const name = String(req.body?.name || '').trim(); const scopes = Array.isArray(req.body?.scopes) ? req.body.scopes.filter((s: unknown) => ['courses:read', 'sales-guidance:read'].includes(String(s))) : [];
+  const name = String(req.body?.name || '').trim(); const scopes = Array.isArray(req.body?.scopes) ? req.body.scopes.filter((s: unknown) => ['courses:read', 'sales-guidance:read', 'agent:read', 'agent:write'].includes(String(s))) : [];
   if (!name || !scopes.includes('courses:read')) return res.status(400).json({ error: 'Name and courses:read scope are required' });
   const generated = createApiKey(); const record = await prisma.apiKey.create({ data: { name, scopes, prefix: generated.prefix, keyHash: generated.hash } });
   await prisma.auditLog.create({ data: { action: 'api_key.created', entityType: 'api_key', entityId: record.id, metadata: { name, scopes } } });
@@ -171,6 +197,7 @@ async function apiAuth(req: express.Request, res: express.Response, next: expres
   await prisma.apiKey.update({ where: { id: key.id }, data: { lastUsedAt: new Date() } });
   res.locals.scopes = key.scopes; next();
 }
+const requireApiScope = (scope: string) => (_req: express.Request, res: express.Response, next: express.NextFunction) => res.locals.scopes.includes(scope) ? next() : res.status(403).json({ error: `${scope} scope required` });
 app.get('/api/v1/courses', apiAuth, async (req, res) => {
   const q = String(req.query.q || '').trim();
   const courses = await prisma.course.findMany({ where: { status: 'PUBLISHED', archivedAt: null, ...(q ? { OR: [{ id: { contains: q, mode: 'insensitive' } }, { name: { contains: q, mode: 'insensitive' } }, { shortDescription: { contains: q, mode: 'insensitive' } }] } : {}) }, select: { id: true, name: true, shortDescription: true, updatedAt: true }, orderBy: { name: 'asc' } });
@@ -182,6 +209,61 @@ app.get('/api/v1/courses/:id', apiAuth, async (req, res) => {
   const requestedSales = req.query.view === 'sales'; const allowedSales = res.locals.scopes.includes('sales-guidance:read');
   if (requestedSales && !allowedSales) return res.status(403).json({ error: 'sales-guidance:read scope required' });
   res.json(projectCourse(course, requestedSales && allowedSales));
+});
+app.get('/api/v1/agent/config', apiAuth, requireApiScope('agent:read'), async (_req, res) => {
+  const published = await prisma.agentConfigurationVersion.findFirst({ orderBy: { version: 'desc' } });
+  if (!published) return res.status(503).json({ error: 'Published agent configuration is unavailable' });
+  res.json(published);
+});
+app.post('/api/v1/agent/meetings', apiAuth, requireApiScope('agent:write'), async (req, res) => {
+  const parsed = agentMeetingInputSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'Invalid meeting request', issues: parsed.error.issues });
+  if (!await prisma.agentConfigurationVersion.findUnique({ where: { version: parsed.data.configurationVersion } })) return res.status(409).json({ error: 'Unknown agent configuration version' });
+  const { startsAt: startsAtText, now: requestedNow, sourceChannel, configurationVersion, summary, ...meeting } = parsed.data;
+  const startsAt = new Date(startsAtText);
+  const now = process.env.NODE_ENV === 'test' && requestedNow ? new Date(requestedNow) : new Date();
+  const result = await reserveMeeting({ ...meeting, startsAt, now }, {
+    create: input => prisma.$transaction(async tx => {
+      const reservation = await tx.meetingReservation.create({ data: { ...input, endsAt: new Date(input.startsAt.getTime() + 60 * 60_000) } });
+      await tx.agentHandoffEvent.create({ data: { type: 'MEETING_CONFIRMED', idempotencyKey: `meeting:${reservation.id}`, payload: { reservationId: reservation.id, customerId: reservation.customerId, customerName: reservation.customerName, phone: reservation.phone, startsAt: reservation.startsAt.toISOString(), mode: reservation.mode, ...(reservation.platform ? { platform: reservation.platform } : {}), sourceChannel, summary, configurationVersion } } });
+      return reservation;
+    }),
+  });
+  if (result.status === 'INVALID_SLOT' || result.status === 'MISSING_PLATFORM') return res.status(400).json(result);
+  if (result.status === 'SLOT_TAKEN') return res.status(409).json(result);
+  res.status(201).json(result);
+});
+app.post('/api/v1/agent/handoffs', apiAuth, requireApiScope('agent:write'), async (req, res) => {
+  const parsed = agentHandoffInputSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'Invalid handoff event', issues: parsed.error.issues });
+  if (parsed.data.type === 'MEETING_CONFIRMED') return res.status(400).json({ error: 'Meeting confirmation events are created only by the meeting reservation endpoint' });
+  if (!await prisma.agentConfigurationVersion.findUnique({ where: { version: parsed.data.payload.configurationVersion } })) return res.status(409).json({ error: 'Unknown agent configuration version' });
+  const existing = await prisma.agentHandoffEvent.findUnique({ where: { idempotencyKey: parsed.data.idempotencyKey } });
+  const event = await createHandoffEvent(parsed.data, {
+    findByIdempotencyKey: key => prisma.agentHandoffEvent.findUnique({ where: { idempotencyKey: key } }),
+    create: input => prisma.agentHandoffEvent.create({ data: { ...input, payload: input.payload as Prisma.InputJsonValue } }),
+  });
+  res.status(existing ? 200 : 201).json(event);
+});
+app.post('/api/v1/agent/respond', apiAuth, requireApiScope('agent:write'), async (req, res) => {
+  const parsed = agentResponseInputSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'Invalid agent response request', issues: parsed.error.issues });
+  const published = await prisma.agentConfigurationVersion.findFirst({ orderBy: { version: 'desc' } });
+  if (!published) return res.status(503).json({ error: 'Published agent configuration is unavailable' });
+  const apiKey = process.env.OPEN_AI_API_KEY;
+  if (!apiKey) return res.status(503).json({ error: 'OPEN_AI_API_KEY is not configured' });
+  let verifiedContext: Record<string, unknown> = {};
+  if (parsed.data.courseId) {
+    const course = await prisma.course.findFirst({ where: { id: parsed.data.courseId, status: 'PUBLISHED', archivedAt: null }, include: { customFields: true, mediaLinks: true } });
+    if (!course) return res.status(404).json({ error: 'Course not found' });
+    verifiedContext = projectCourse(course, res.locals.scopes.includes('sales-guidance:read'));
+  }
+  try {
+    const reply = await generateSalesReply({ persona: published.persona, configurationVersion: published.version, customerInput: parsed.data.customerInput, conversationState: parsed.data.conversationState, verifiedContext }, createSalesAiClient(apiKey));
+    res.json({ reply, configurationVersion: published.version });
+  } catch {
+    res.status(502).json({ error: 'The sales agent is temporarily unavailable' });
+  }
 });
 
 const here = path.dirname(fileURLToPath(import.meta.url));

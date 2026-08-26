@@ -25,6 +25,23 @@ enum MediaType {
   OTHER
 }
 
+enum MeetingMode {
+  ONLINE
+  FACE_TO_FACE
+}
+
+enum MeetingPlatform {
+  GOOGLE_MEET
+  ZOOM
+  DISCORD
+}
+
+enum FollowUpStatus {
+  PENDING
+  CANCELLED
+  SENT
+}
+
 model AppConfig {
   id           Int      @id @default(1)
   passwordHash String
@@ -111,4 +128,101 @@ model AuditLog {
   metadata   Json?
   createdAt  DateTime @default(now())
   @@index([createdAt])
+}
+
+model AgentConfigurationDraft {
+  id        String   @id @default("current")
+  persona   String   @db.Text
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model AgentConfigurationVersion {
+  id            String   @id @default(cuid())
+  version       Int      @unique
+  persona       String   @db.Text
+  sourceDraftId String
+  publishedAt   DateTime @default(now())
+}
+
+model AgentConversation {
+  id            String           @id @default(cuid())
+  channel       String
+  customerId    String
+  state         Json
+  lastInboundAt DateTime?
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
+  messages      AgentMessage[]
+  batches       AgentMessageBatch[]
+  followUps     AgentFollowUp[]
+
+  @@unique([channel, customerId])
+}
+
+model AgentMessage {
+  id              String            @id @default(cuid())
+  sourceMessageId String
+  kind            String
+  normalizedText  String            @db.Text
+  occurredAt      DateTime
+  createdAt       DateTime          @default(now())
+  conversationId  String
+  conversation    AgentConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  batchId         String?
+  batch           AgentMessageBatch? @relation(fields: [batchId], references: [id], onDelete: SetNull)
+
+  @@unique([conversationId, sourceMessageId])
+  @@index([conversationId, occurredAt])
+}
+
+model AgentMessageBatch {
+  id             String            @id @default(cuid())
+  status         String            @default("OPEN")
+  flushAt        DateTime
+  combinedInput  String            @default("") @db.Text
+  processedAt    DateTime?
+  createdAt      DateTime          @default(now())
+  conversationId String
+  conversation   AgentConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  messages       AgentMessage[]
+
+  @@index([status, flushAt])
+}
+
+model MeetingReservation {
+  id           String           @id @default(cuid())
+  customerId   String
+  customerName String
+  phone        String
+  mode         MeetingMode
+  platform     MeetingPlatform?
+  startsAt     DateTime         @unique
+  endsAt       DateTime
+  createdAt    DateTime         @default(now())
+}
+
+model AgentFollowUp {
+  id             String            @id @default(cuid())
+  stage          Int
+  dueAt          DateTime
+  status         FollowUpStatus    @default(PENDING)
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+  conversationId String
+  conversation   AgentConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@unique([conversationId, stage])
+  @@index([status, dueAt])
+}
+
+model AgentHandoffEvent {
+  id             String   @id @default(cuid())
+  type           String
+  idempotencyKey String   @unique
+  payload        Json
+  createdAt      DateTime @default(now())
+  deliveredAt    DateTime?
+
+  @@index([type, createdAt])
 }

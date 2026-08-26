@@ -29,6 +29,40 @@ const customFieldSchema = z.object({
 
 export const globalFieldInputSchema = customFieldSchema;
 
+export const agentConfigurationDraftSchema = z.object({
+  persona: z.string().trim().min(1).max(200_000),
+});
+
+export const agentMeetingInputSchema = z.object({
+  customerId: z.string().trim().min(1).max(240),
+  customerName: z.string().trim().min(1).max(240),
+  phone: z.string().trim().min(5).max(40),
+  mode: z.enum(['ONLINE', 'FACE_TO_FACE']),
+  platform: z.enum(['GOOGLE_MEET', 'ZOOM', 'DISCORD']).optional(),
+  startsAt: z.iso.datetime(),
+  now: z.iso.datetime().optional(),
+  sourceChannel: z.string().trim().min(1).max(80),
+  configurationVersion: z.number().int().positive(),
+  summary: z.string().trim().min(1).max(2_000),
+});
+
+const handoffBase = z.object({
+  idempotencyKey: z.string().trim().min(1).max(240),
+});
+const eventContext = { sourceChannel: z.string().trim().min(1).max(80), summary: z.string().trim().min(1).max(2_000), configurationVersion: z.number().int().positive() };
+export const agentHandoffInputSchema = z.discriminatedUnion('type', [
+  handoffBase.extend({ type: z.literal('AI_AUTOMATION_LEAD'), payload: z.object({ ...eventContext, qualificationStatus: z.enum(['qualified', 'needs_human_discovery']), phone: z.string().trim().min(5).max(40), name: z.string().trim().max(240).optional(), qualificationReason: z.string().trim().max(240).optional() }) }),
+  handoffBase.extend({ type: z.literal('MEETING_CONFIRMED'), payload: z.object({ ...eventContext, reservationId: z.string().min(1), customerId: z.string().min(1), customerName: z.string().min(1), phone: z.string().min(5), startsAt: z.iso.datetime(), mode: z.enum(['ONLINE', 'FACE_TO_FACE']), platform: z.enum(['GOOGLE_MEET', 'ZOOM', 'DISCORD']).optional() }) }),
+  handoffBase.extend({ type: z.literal('CONSULTATION_REQUEST'), payload: z.object({ ...eventContext, phone: z.string().trim().min(5).max(40), reason: z.string().trim().min(1).max(2_000), name: z.string().trim().max(240).optional() }) }),
+  handoffBase.extend({ type: z.literal('COURSE_ENROLLMENT'), payload: z.object({ ...eventContext, courseId: z.string().min(1), email: z.email(), phone: z.string().min(5), paymentPreference: z.string().min(1), name: z.string().max(240).optional() }) }),
+]);
+
+export const agentResponseInputSchema = z.object({
+  customerInput: z.string().trim().min(1).max(100_000),
+  conversationState: z.record(z.string(), z.unknown()).default({}),
+  courseId: z.string().trim().min(1).max(64).optional(),
+});
+
 const mediaLinkSchema = z.object({
   label: z.string().trim().min(1).max(120),
   url: z.url(),

@@ -20,6 +20,7 @@ export async function requireAdmin(req: Request, res: Response, next: NextFuncti
 export function csrfGuard(req: Request, res: Response, next: NextFunction) {
   if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
   if (req.path === '/auth/login') return next();
+  if (req.path.startsWith('/v1/')) return next();
   const cookie = req.cookies?.mustaner_csrf;
   const header = req.header('x-csrf-token');
   if (!cookie || !header || cookie !== header) return res.status(403).json({ error: 'Invalid CSRF token' });

@@ -6,7 +6,7 @@ type Key = { id: string; name: string; prefix: string; scopes: string[]; created
 export function ApiKeys() {
   const [keys, setKeys] = useState<Key[]>([]); const [name, setName] = useState('n8n sales agent'); const [sales, setSales] = useState(true); const [created, setCreated] = useState('');
   const load = () => api<Key[]>('/admin/api-keys').then(setKeys); useEffect(() => { load(); }, []);
-  async function create() { const result = await api<{ key: string }>('/admin/api-keys', { method: 'POST', body: JSON.stringify({ name, scopes: ['courses:read', ...(sales ? ['sales-guidance:read'] : [])] }) }); setCreated(result.key); load(); }
+  async function create() { const result = await api<{ key: string }>('/admin/api-keys', { method: 'POST', body: JSON.stringify({ name, scopes: ['courses:read', 'agent:read', 'agent:write', ...(sales ? ['sales-guidance:read'] : [])] }) }); setCreated(result.key); load(); }
   async function revoke(id: string) { await api(`/admin/api-keys/${id}/revoke`, { method: 'POST' }); load(); }
   return <section><div className="page-head"><div><p className="eyebrow">Integration security</p><h1>API access</h1><p>Create scoped credentials for the sales agent and other trusted systems.</p></div></div>
     {created && <div className="secret-callout"><div><strong>Copy this key now</strong><code>{created}</code><small>It will never be displayed again.</small></div><button className="secondary" onClick={() => navigator.clipboard.writeText(created)}><Copy size={16} /> Copy</button></div>}
