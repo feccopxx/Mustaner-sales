@@ -5,8 +5,9 @@ import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { randomUUID } from 'node:crypto';
 import { prisma } from './prisma.js';
-import { agentConfigurationDraftSchema, agentHandoffInputSchema, agentMeetingInputSchema, agentResponseInputSchema, courseInputSchema, globalFieldInputSchema } from './domain.js';
+import { agentBatchClaimSchema, agentConfigurationDraftSchema, agentHandoffInputSchema, agentInboundMessageSchema, agentMeetingInputSchema, agentResponseInputSchema, courseInputSchema, globalFieldInputSchema } from './domain.js';
 import { createApiKey, hashPassword, synchronizePasswordHash, verifyApiKey, verifyPassword } from './security.js';
 import { csrfGuard, issueSession, newCsrfToken, requireAdmin } from './auth.js';
 import { projectCourse } from './course-projection.js';
@@ -16,6 +17,8 @@ import { reserveMeeting } from './agent/booking.js';
 import { createHandoffEvent } from './agent/handoff.js';
 import { createSalesAiClient, generateSalesReply } from './agent/runtime.js';
 import { publishAgentConfiguration } from './agent/configuration.js';
+import { nextBatchFlushAt, normalizeInboundMessage } from './agent/inbound.js';
+import { scheduleFollowUps } from './agent/follow-up.js';
 
 const include = { customFields: true, mediaLinks: true } as const;
 const param = (value: string | string[]) => Array.isArray(value) ? value[0] : value;
@@ -215,6 +218,79 @@ app.get('/api/v1/agent/config', apiAuth, requireApiScope('agent:read'), async (_
   if (!published) return res.status(503).json({ error: 'Published agent configuration is unavailable' });
   res.json(published);
 });
+app.post('/api/v1/agent/messages', apiAuth, requireApiScope('agent:write'), async (req, res) => {
+  const parsed = agentInboundMessageSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'Invalid inbound message', issues: parsed.error.issues });
+  const occurredAt = new Date(parsed.data.occurredAt);
+  const receivedAt = process.env.NODE_ENV === 'test' && parsed.data.receivedAt ? new Date(parsed.data.receivedAt) : new Date();
+  try {
+    const result = await prisma.$transaction(async tx => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`${parsed.data.channel}:${parsed.data.customerId}`}))`;
+      const identity = { channel_customerId: { channel: parsed.data.channel, customerId: parsed.data.customerId } };
+      let conversation = await tx.agentConversation.findUnique({ where: identity });
+      if (conversation) {
+        const duplicate = await tx.agentMessage.findUnique({ where: { conversationId_sourceMessageId: { conversationId: conversation.id, sourceMessageId: parsed.data.sourceMessageId } } });
+        if (duplicate) return { duplicate: true as const };
+        conversation = await tx.agentConversation.update({ where: { id: conversation.id }, data: { lastInboundAt: receivedAt } });
+      } else {
+        conversation = await tx.agentConversation.create({ data: { channel: parsed.data.channel, customerId: parsed.data.customerId, state: {}, lastInboundAt: receivedAt } });
+      }
+      const duplicate = await tx.agentMessage.findUnique({ where: { conversationId_sourceMessageId: { conversationId: conversation.id, sourceMessageId: parsed.data.sourceMessageId } } });
+      if (duplicate) return { duplicate: true as const };
+      await tx.agentFollowUp.updateMany({ where: { conversationId: conversation.id, status: 'PENDING' }, data: { status: 'CANCELLED' } });
+      const flushAt = nextBatchFlushAt(receivedAt);
+      let batch = await tx.agentMessageBatch.findFirst({ where: { conversationId: conversation.id, status: 'OPEN' }, orderBy: { createdAt: 'desc' } });
+      batch = batch ? await tx.agentMessageBatch.update({ where: { id: batch.id }, data: { flushAt } }) : await tx.agentMessageBatch.create({ data: { conversationId: conversation.id, flushAt } });
+      await tx.agentMessage.create({ data: { conversationId: conversation.id, batchId: batch.id, sourceMessageId: parsed.data.sourceMessageId, kind: parsed.data.kind, normalizedText: normalizeInboundMessage({ id: parsed.data.sourceMessageId, kind: parsed.data.kind, text: parsed.data.text, occurredAt }), occurredAt, receivedAt } });
+      return { duplicate: false as const, batch };
+    });
+    if (result.duplicate) return res.json({ status: 'DUPLICATE' });
+    res.status(202).json({ status: 'BUFFERED', batchId: result.batch.id, flushAt: result.batch.flushAt.toISOString() });
+  } catch (error) {
+    if (typeof error === 'object' && error !== null && 'code' in error && error.code === 'P2002') return res.json({ status: 'DUPLICATE' });
+    throw error;
+  }
+});
+app.post('/api/v1/agent/batches/claim', apiAuth, requireApiScope('agent:write'), async (req, res) => {
+  const parsed = agentBatchClaimSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'Invalid batch claim', issues: parsed.error.issues });
+  const now = process.env.NODE_ENV === 'test' && parsed.data.now ? new Date(parsed.data.now) : new Date();
+  const claimed = await prisma.$transaction(async tx => {
+    const candidate = await tx.agentMessageBatch.findFirst({ where: { status: 'OPEN', flushAt: { lte: now } }, include: { conversation: true }, orderBy: { flushAt: 'asc' } });
+    if (!candidate) return null;
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`${candidate.conversation.channel}:${candidate.conversation.customerId}`}))`;
+    const batch = await tx.agentMessageBatch.findUnique({ where: { id: candidate.id }, include: { messages: { orderBy: [{ occurredAt: 'asc' }, { receivedAt: 'asc' }, { id: 'asc' }] } } });
+    if (!batch || batch.status !== 'OPEN' || batch.flushAt > now) return null;
+    const won = await tx.agentMessageBatch.updateMany({ where: { id: batch.id, status: 'OPEN' }, data: { status: 'PROCESSING' } });
+    if (won.count !== 1) return null;
+    const messages = [...batch.messages].sort((left, right) => left.occurredAt.getTime() - right.occurredAt.getTime()
+      || left.receivedAt.getTime() - right.receivedAt.getTime()
+      || left.id.localeCompare(right.id));
+    const customerInput = messages.map(message => message.normalizedText).filter(Boolean).join('\n');
+    await tx.agentMessageBatch.update({ where: { id: batch.id }, data: { combinedInput: customerInput } });
+    return { batchId: batch.id, customerInput };
+  });
+  if (!claimed) return res.status(204).end();
+  res.json(claimed);
+});
+app.post('/api/v1/agent/batches/:id/delivered', apiAuth, requireApiScope('agent:write'), async (req, res) => {
+  const batchId = param(req.params.id);
+  await prisma.$transaction(async tx => {
+    const candidate = await tx.agentMessageBatch.findUnique({ where: { id: batchId }, include: { conversation: true } });
+    if (!candidate) return;
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`${candidate.conversation.channel}:${candidate.conversation.customerId}`}))`;
+    const batch = await tx.agentMessageBatch.findUnique({ where: { id: batchId }, include: { conversation: true, messages: { orderBy: { receivedAt: 'desc' }, take: 1 } } });
+    if (!batch) return;
+    const deliveredAt = new Date();
+    const won = await tx.agentMessageBatch.updateMany({ where: { id: batchId, status: 'READY_TO_SEND' }, data: { status: 'PROCESSED', processedAt: deliveredAt, deliveredAt } });
+    if (won.count !== 1) return;
+    const batchLatest = batch.messages[0]?.receivedAt;
+    if (!batchLatest || !batch.conversation.lastInboundAt || batch.conversation.lastInboundAt.getTime() !== batchLatest.getTime()) return;
+    const [first, second] = scheduleFollowUps(batch.conversation.lastInboundAt);
+    for (const [stage, dueAt] of [[1, first], [2, second]] as const) await tx.agentFollowUp.upsert({ where: { conversationId_stage: { conversationId: batch.conversationId, stage } }, create: { conversationId: batch.conversationId, stage, dueAt }, update: { dueAt, status: 'PENDING' } });
+  });
+  res.status(204).end();
+});
 app.post('/api/v1/agent/meetings', apiAuth, requireApiScope('agent:write'), async (req, res) => {
   const parsed = agentMeetingInputSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: 'Invalid meeting request', issues: parsed.error.issues });
@@ -248,6 +324,15 @@ app.post('/api/v1/agent/handoffs', apiAuth, requireApiScope('agent:write'), asyn
 app.post('/api/v1/agent/respond', apiAuth, requireApiScope('agent:write'), async (req, res) => {
   const parsed = agentResponseInputSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: 'Invalid agent response request', issues: parsed.error.issues });
+  let batch = await prisma.agentMessageBatch.findUnique({ where: { id: parsed.data.batchId }, include: { conversation: true } });
+  if (!batch) return res.status(404).json({ error: 'Message batch not found' });
+  if (batch.status === 'READY_TO_SEND' && batch.responseText && batch.configurationVersion) return res.json({ reply: batch.responseText, configurationVersion: batch.configurationVersion });
+  if (batch.status === 'GENERATING' && batch.generationStartedAt && batch.generationStartedAt.getTime() <= Date.now() - 5 * 60_000) {
+    await prisma.agentMessageBatch.updateMany({ where: { id: batch.id, status: 'GENERATING', generationStartedAt: { lte: new Date(Date.now() - 5 * 60_000) } }, data: { status: 'PROCESSING', generationStartedAt: null, generationToken: null } });
+    batch = await prisma.agentMessageBatch.findUnique({ where: { id: parsed.data.batchId }, include: { conversation: true } });
+    if (!batch) return res.status(404).json({ error: 'Message batch not found' });
+  }
+  if (batch.status !== 'PROCESSING' || !batch.combinedInput) return res.status(409).json({ error: 'Message batch is not ready for generation' });
   const published = await prisma.agentConfigurationVersion.findFirst({ orderBy: { version: 'desc' } });
   if (!published) return res.status(503).json({ error: 'Published agent configuration is unavailable' });
   const apiKey = process.env.OPEN_AI_API_KEY;
@@ -258,10 +343,16 @@ app.post('/api/v1/agent/respond', apiAuth, requireApiScope('agent:write'), async
     if (!course) return res.status(404).json({ error: 'Course not found' });
     verifiedContext = projectCourse(course, res.locals.scopes.includes('sales-guidance:read'));
   }
+  const generationToken = randomUUID();
+  const generationClaim = await prisma.agentMessageBatch.updateMany({ where: { id: batch.id, status: 'PROCESSING' }, data: { status: 'GENERATING', generationStartedAt: new Date(), generationToken } });
+  if (generationClaim.count !== 1) return res.status(409).json({ error: 'Message batch is already being generated' });
   try {
-    const reply = await generateSalesReply({ persona: published.persona, configurationVersion: published.version, customerInput: parsed.data.customerInput, conversationState: parsed.data.conversationState, verifiedContext }, createSalesAiClient(apiKey));
+    const reply = await generateSalesReply({ persona: published.persona, configurationVersion: published.version, customerInput: batch.combinedInput, conversationState: batch.conversation.state as Record<string, unknown>, verifiedContext }, createSalesAiClient(apiKey));
+    const completed = await prisma.agentMessageBatch.updateMany({ where: { id: batch.id, status: 'GENERATING', generationToken }, data: { status: 'READY_TO_SEND', responseText: reply, configurationVersion: published.version, generationStartedAt: null, generationToken: null } });
+    if (completed.count !== 1) return res.status(409).json({ error: 'Generation lease expired; retry the batch' });
     res.json({ reply, configurationVersion: published.version });
   } catch {
+    await prisma.agentMessageBatch.updateMany({ where: { id: batch.id, status: 'GENERATING', generationToken }, data: { status: 'PROCESSING', generationStartedAt: null, generationToken: null } });
     res.status(502).json({ error: 'The sales agent is temporarily unavailable' });
   }
 });

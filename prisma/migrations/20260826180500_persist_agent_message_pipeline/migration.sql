@@ -1,0 +1,12 @@
+ALTER TABLE "AgentMessageBatch"
+ADD COLUMN "responseText" TEXT NOT NULL DEFAULT '',
+ADD COLUMN "configurationVersion" INTEGER,
+ADD COLUMN "generationStartedAt" TIMESTAMP(3),
+ADD COLUMN "generationToken" TEXT,
+ADD COLUMN "deliveredAt" TIMESTAMP(3);
+
+ALTER TABLE "AgentMessage"
+ADD COLUMN "receivedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP;
+
+ALTER TABLE "AgentMessage"
+ALTER COLUMN "receivedAt" DROP DEFAULT;

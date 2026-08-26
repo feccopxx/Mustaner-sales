@@ -58,10 +58,21 @@ export const agentHandoffInputSchema = z.discriminatedUnion('type', [
 ]);
 
 export const agentResponseInputSchema = z.object({
-  customerInput: z.string().trim().min(1).max(100_000),
-  conversationState: z.record(z.string(), z.unknown()).default({}),
+  batchId: z.string().trim().min(1).max(240),
   courseId: z.string().trim().min(1).max(64).optional(),
 });
+
+export const agentInboundMessageSchema = z.object({
+  channel: z.string().trim().min(1).max(80),
+  customerId: z.string().trim().min(1).max(240),
+  sourceMessageId: z.string().trim().min(1).max(240),
+  kind: z.enum(['TEXT', 'VOICE', 'IMAGE', 'PDF', 'DOCX', 'VIDEO', 'OTHER']),
+  text: z.string().max(100_000),
+  occurredAt: z.iso.datetime(),
+  receivedAt: z.iso.datetime().optional(),
+});
+
+export const agentBatchClaimSchema = z.object({ now: z.iso.datetime().optional() });
 
 const mediaLinkSchema = z.object({
   label: z.string().trim().min(1).max(120),

@@ -166,6 +166,7 @@ model AgentMessage {
   kind            String
   normalizedText  String            @db.Text
   occurredAt      DateTime
+  receivedAt      DateTime
   createdAt       DateTime          @default(now())
   conversationId  String
   conversation    AgentConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
@@ -181,7 +182,12 @@ model AgentMessageBatch {
   status         String            @default("OPEN")
   flushAt        DateTime
   combinedInput  String            @default("") @db.Text
+  responseText   String            @default("") @db.Text
+  configurationVersion Int?
+  generationStartedAt DateTime?
+  generationToken String?
   processedAt    DateTime?
+  deliveredAt    DateTime?
   createdAt      DateTime          @default(now())
   conversationId String
   conversation   AgentConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
