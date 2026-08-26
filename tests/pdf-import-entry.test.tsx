@@ -25,6 +25,17 @@ describe('PDF import entry point', () => {
     expect(screen.getByRole('img', { name: 'Professional organizing PDF course data into structured learning information' })).toBeInTheDocument();
   });
 
+  it('uses a header file chooser and keeps extraction beneath the focal illustration', async () => {
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Import from PDF' }));
+
+    expect(screen.getByText('Choose file').closest('label')).toHaveAttribute('for', 'course-pdf');
+    const importer = screen.getByLabelText('Import course from PDF');
+    expect(importer.querySelector('.pdf-import-illustration')?.nextElementSibling?.textContent).toContain('Extract course details');
+    expect(screen.getByLabelText('Course PDF')).toHaveClass('visually-hidden');
+  });
+
   it('places the archive control below audit log in the workspace navigation', async () => {
     render(<App />);
 
