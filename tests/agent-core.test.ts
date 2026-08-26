@@ -42,6 +42,11 @@ describe('agent inbound message handling', () => {
       id: 'p1', kind: 'PDF', text: 'one\ntwo\nthree\nfour\nfive\nsix', occurredAt: new Date(),
     })).toBe('User sent a PDF with these details:\none\ntwo\nthree\nfour\nfive');
   });
+
+  it('does not label an already-normalized media relay twice', () => {
+    const relay = 'User sent a PDF with these details:\none\ntwo';
+    expect(normalizeInboundMessage({ id: 'p2', kind: 'PDF', text: relay, occurredAt: new Date() })).toBe(relay);
+  });
 });
 
 describe('AI and automation qualification', () => {

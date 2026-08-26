@@ -5,9 +5,9 @@ import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { prisma } from './prisma.js';
-import { agentBatchClaimSchema, agentConfigurationDraftSchema, agentHandoffInputSchema, agentInboundMessageSchema, agentMeetingInputSchema, agentResponseInputSchema, courseInputSchema, globalFieldInputSchema } from './domain.js';
+import { agentBatchClaimSchema, agentConfigurationDraftSchema, agentDeliveryReconcileSchema, agentHandoffInputSchema, agentInboundMessageSchema, agentMeetingInputSchema, agentResponseInputSchema, courseInputSchema, globalFieldInputSchema } from './domain.js';
 import { createApiKey, hashPassword, synchronizePasswordHash, verifyApiKey, verifyPassword } from './security.js';
 import { csrfGuard, issueSession, newCsrfToken, requireAdmin } from './auth.js';
 import { projectCourse } from './course-projection.js';
@@ -19,6 +19,10 @@ import { createSalesAiClient, generateSalesReply } from './agent/runtime.js';
 import { publishAgentConfiguration } from './agent/configuration.js';
 import { nextBatchFlushAt, normalizeInboundMessage } from './agent/inbound.js';
 import { scheduleFollowUps } from './agent/follow-up.js';
+import { classifyMessengerMedia, downloadMessengerMedia, parseMessengerWebhook, sendMessengerText, verifyMessengerSignature } from './integrations/messenger.js';
+import { createOpenAiMediaClient, extractMediaMessage } from './integrations/media.js';
+import { dispatchHumanAlert } from './integrations/notifications.js';
+import { syncLeadToOdoo } from './integrations/odoo.js';
 
 const include = { customFields: true, mediaLinks: true } as const;
 const param = (value: string | string[]) => Array.isArray(value) ? value[0] : value;
@@ -31,13 +35,18 @@ const mergeGlobalFields = async (customFields: Array<{ name: string; content: st
 export const app = express();
 app.set('trust proxy', 1);
 app.use(helmet({ contentSecurityPolicy: false }));
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '1mb', verify: (req, _res, buffer) => { (req as express.Request & { rawBody?: Buffer }).rawBody = Buffer.from(buffer); } }));
 app.use(cookieParser());
 app.use('/api', csrfGuard);
 
 const loginLimiter = rateLimit({ windowMs: 5 * 60_000, limit: 12, standardHeaders: true, legacyHeaders: false, skipSuccessfulRequests: true, handler: (_req, res) => { res.status(429).json({ error: 'Too many login attempts. Try again in a few minutes.' }); } });
 
 app.get('/api/health', (_req, res) => res.json({ status: 'ok' }));
+app.get('/api/v1/integrations/messenger/webhook', (req, res) => {
+  const valid = req.query['hub.mode'] === 'subscribe' && req.query['hub.verify_token'] === process.env.MESSENGER_VERIFY_TOKEN;
+  if (!valid) return res.status(403).send('Forbidden');
+  res.send(String(req.query['hub.challenge'] || ''));
+});
 app.get('/api/auth/session', requireAdmin, (_req, res) => res.json({ authenticated: true }));
 app.post('/api/auth/login', loginLimiter, async (req, res) => {
   const password = typeof req.body?.password === 'string' ? req.body.password : '';
@@ -218,32 +227,76 @@ app.get('/api/v1/agent/config', apiAuth, requireApiScope('agent:read'), async (_
   if (!published) return res.status(503).json({ error: 'Published agent configuration is unavailable' });
   res.json(published);
 });
+type PersistedInbound = { channel: string; customerId: string; sourceMessageId: string; kind: 'TEXT' | 'VOICE' | 'IMAGE' | 'PDF' | 'DOCX' | 'VIDEO' | 'OTHER'; text: string; mediaUrl?: string; occurredAt: string; receivedAt?: string };
+const persistInboundMessage = async (input: PersistedInbound) => {
+  const occurredAt = new Date(input.occurredAt);
+  const receivedAt = process.env.NODE_ENV === 'test' && input.receivedAt ? new Date(input.receivedAt) : new Date();
+  return prisma.$transaction(async tx => {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`${input.channel}:${input.customerId}`}))`;
+    const identity = { channel_customerId: { channel: input.channel, customerId: input.customerId } };
+    let conversation = await tx.agentConversation.findUnique({ where: identity });
+    if (conversation) {
+      const duplicate = await tx.agentMessage.findUnique({ where: { conversationId_sourceMessageId: { conversationId: conversation.id, sourceMessageId: input.sourceMessageId } } });
+      if (duplicate) return { duplicate: true as const };
+      await tx.agentMessageBatch.updateMany({ where: { conversationId: conversation.id, status: 'READY_TO_SEND', deliveryStatus: 'PENDING' }, data: { status: 'SUPERSEDED' } });
+      conversation = await tx.agentConversation.update({ where: { id: conversation.id }, data: { lastInboundAt: receivedAt } });
+    } else conversation = await tx.agentConversation.create({ data: { channel: input.channel, customerId: input.customerId, state: {}, lastInboundAt: receivedAt } });
+    const duplicate = await tx.agentMessage.findUnique({ where: { conversationId_sourceMessageId: { conversationId: conversation.id, sourceMessageId: input.sourceMessageId } } });
+    if (duplicate) return { duplicate: true as const };
+    await tx.agentFollowUp.updateMany({ where: { conversationId: conversation.id, status: 'PENDING' }, data: { status: 'CANCELLED' } });
+    const flushAt = nextBatchFlushAt(receivedAt);
+    let batch = await tx.agentMessageBatch.findFirst({ where: { conversationId: conversation.id, status: 'OPEN' }, orderBy: { createdAt: 'desc' } });
+    batch = batch ? await tx.agentMessageBatch.update({ where: { id: batch.id }, data: { flushAt } }) : await tx.agentMessageBatch.create({ data: { conversationId: conversation.id, flushAt } });
+    await tx.agentMessage.create({ data: { conversationId: conversation.id, batchId: batch.id, sourceMessageId: input.sourceMessageId, kind: input.kind, normalizedText: input.mediaUrl ? '' : normalizeInboundMessage({ id: input.sourceMessageId, kind: input.kind, text: input.text, occurredAt }), occurredAt, receivedAt, mediaUrl: input.mediaUrl, mediaStatus: input.mediaUrl ? 'PENDING' : 'READY' } });
+    return { duplicate: false as const, batch };
+  });
+};
+
+export async function processPendingMediaJobs(limit = 4): Promise<number> {
+  const apiKey = process.env.OPEN_AI_API_KEY;
+  if (!apiKey) return 0;
+  const jobs = await prisma.agentMessage.findMany({ where: { OR: [{ mediaStatus: 'PENDING' }, { mediaStatus: 'PROCESSING', mediaStartedAt: { lte: new Date(Date.now() - 5 * 60_000) } }] }, orderBy: { receivedAt: 'asc' }, take: limit });
+  const client = createOpenAiMediaClient(apiKey); let completed = 0;
+  for (const job of jobs) {
+    const leaseToken = randomUUID();
+    const claimed = await prisma.agentMessage.updateMany({ where: { id: job.id, mediaStatus: job.mediaStatus, ...(job.mediaStatus === 'PROCESSING' ? { mediaStartedAt: job.mediaStartedAt } : {}) }, data: { mediaStatus: 'PROCESSING', mediaStartedAt: new Date(), mediaLeaseToken: leaseToken, mediaAttempts: { increment: 1 }, mediaError: null } });
+    if (claimed.count !== 1 || !job.mediaUrl) continue;
+    try {
+      const media = await downloadMessengerMedia(job.mediaUrl);
+      const kind = classifyMessengerMedia(job.kind as PersistedInbound['kind'], media.mimeType, media.filename);
+      const text = await extractMediaMessage({ kind: kind === 'TEXT' ? 'OTHER' : kind, ...media }, client);
+      await prisma.$transaction(async tx => {
+        const won = await tx.agentMessage.updateMany({ where: { id: job.id, mediaStatus: 'PROCESSING', mediaLeaseToken: leaseToken }, data: { kind, normalizedText: text, mediaStatus: 'READY', mediaStartedAt: null, mediaLeaseToken: null } });
+        if (won.count === 1 && job.batchId) await tx.agentMessageBatch.update({ where: { id: job.batchId }, data: { flushAt: nextBatchFlushAt(new Date()) } });
+      });
+      completed++;
+    } catch (error) {
+      const terminal = job.mediaAttempts + 1 >= 3;
+      const fallback = `User sent a ${job.kind} with these details:\nThe media could not be processed after multiple attempts.\nA human team member should review the original attachment.`;
+      await prisma.$transaction(async tx => {
+        const won = await tx.agentMessage.updateMany({ where: { id: job.id, mediaStatus: 'PROCESSING', mediaLeaseToken: leaseToken }, data: { mediaStatus: terminal ? 'FAILED' : 'PENDING', normalizedText: terminal ? fallback : job.normalizedText, mediaStartedAt: null, mediaLeaseToken: null, mediaError: error instanceof Error ? error.message.slice(0, 2_000) : 'Media processing failed' } });
+        if (won.count === 1 && terminal && job.batchId) await tx.agentMessageBatch.update({ where: { id: job.batchId }, data: { flushAt: nextBatchFlushAt(new Date()) } });
+      });
+    }
+  }
+  return completed;
+}
+
+app.post('/api/v1/integrations/messenger/webhook', async (req, res) => {
+  const secret = process.env.MESSENGER_APP_SECRET || '';
+  const rawBody = (req as express.Request & { rawBody?: Buffer }).rawBody || Buffer.alloc(0);
+  if (!verifyMessengerSignature(rawBody, req.header('x-hub-signature-256'), secret)) return res.status(401).json({ error: 'Invalid Messenger signature' });
+  const messages = parseMessengerWebhook(req.body);
+  await Promise.all(messages.map(message => persistInboundMessage(message)));
+  res.json({ status: 'ACCEPTED', count: messages.length });
+  if (messages.some(message => message.mediaUrl)) setImmediate(() => { void processPendingMediaJobs().catch(() => undefined); });
+});
+
 app.post('/api/v1/agent/messages', apiAuth, requireApiScope('agent:write'), async (req, res) => {
   const parsed = agentInboundMessageSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: 'Invalid inbound message', issues: parsed.error.issues });
-  const occurredAt = new Date(parsed.data.occurredAt);
-  const receivedAt = process.env.NODE_ENV === 'test' && parsed.data.receivedAt ? new Date(parsed.data.receivedAt) : new Date();
   try {
-    const result = await prisma.$transaction(async tx => {
-      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`${parsed.data.channel}:${parsed.data.customerId}`}))`;
-      const identity = { channel_customerId: { channel: parsed.data.channel, customerId: parsed.data.customerId } };
-      let conversation = await tx.agentConversation.findUnique({ where: identity });
-      if (conversation) {
-        const duplicate = await tx.agentMessage.findUnique({ where: { conversationId_sourceMessageId: { conversationId: conversation.id, sourceMessageId: parsed.data.sourceMessageId } } });
-        if (duplicate) return { duplicate: true as const };
-        conversation = await tx.agentConversation.update({ where: { id: conversation.id }, data: { lastInboundAt: receivedAt } });
-      } else {
-        conversation = await tx.agentConversation.create({ data: { channel: parsed.data.channel, customerId: parsed.data.customerId, state: {}, lastInboundAt: receivedAt } });
-      }
-      const duplicate = await tx.agentMessage.findUnique({ where: { conversationId_sourceMessageId: { conversationId: conversation.id, sourceMessageId: parsed.data.sourceMessageId } } });
-      if (duplicate) return { duplicate: true as const };
-      await tx.agentFollowUp.updateMany({ where: { conversationId: conversation.id, status: 'PENDING' }, data: { status: 'CANCELLED' } });
-      const flushAt = nextBatchFlushAt(receivedAt);
-      let batch = await tx.agentMessageBatch.findFirst({ where: { conversationId: conversation.id, status: 'OPEN' }, orderBy: { createdAt: 'desc' } });
-      batch = batch ? await tx.agentMessageBatch.update({ where: { id: batch.id }, data: { flushAt } }) : await tx.agentMessageBatch.create({ data: { conversationId: conversation.id, flushAt } });
-      await tx.agentMessage.create({ data: { conversationId: conversation.id, batchId: batch.id, sourceMessageId: parsed.data.sourceMessageId, kind: parsed.data.kind, normalizedText: normalizeInboundMessage({ id: parsed.data.sourceMessageId, kind: parsed.data.kind, text: parsed.data.text, occurredAt }), occurredAt, receivedAt } });
-      return { duplicate: false as const, batch };
-    });
+    const result = await persistInboundMessage(parsed.data);
     if (result.duplicate) return res.json({ status: 'DUPLICATE' });
     res.status(202).json({ status: 'BUFFERED', batchId: result.batch.id, flushAt: result.batch.flushAt.toISOString() });
   } catch (error) {
@@ -256,7 +309,7 @@ app.post('/api/v1/agent/batches/claim', apiAuth, requireApiScope('agent:write'),
   if (!parsed.success) return res.status(400).json({ error: 'Invalid batch claim', issues: parsed.error.issues });
   const now = process.env.NODE_ENV === 'test' && parsed.data.now ? new Date(parsed.data.now) : new Date();
   const claimed = await prisma.$transaction(async tx => {
-    const candidate = await tx.agentMessageBatch.findFirst({ where: { status: 'OPEN', flushAt: { lte: now } }, include: { conversation: true }, orderBy: { flushAt: 'asc' } });
+    const candidate = await tx.agentMessageBatch.findFirst({ where: { status: 'OPEN', flushAt: { lte: now }, messages: { none: { mediaStatus: { in: ['PENDING', 'PROCESSING'] } } } }, include: { conversation: true }, orderBy: { flushAt: 'asc' } });
     if (!candidate) return null;
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`${candidate.conversation.channel}:${candidate.conversation.customerId}`}))`;
     const batch = await tx.agentMessageBatch.findUnique({ where: { id: candidate.id }, include: { messages: { orderBy: [{ occurredAt: 'asc' }, { receivedAt: 'asc' }, { id: 'asc' }] } } });
@@ -273,6 +326,64 @@ app.post('/api/v1/agent/batches/claim', apiAuth, requireApiScope('agent:write'),
   if (!claimed) return res.status(204).end();
   res.json(claimed);
 });
+app.post('/api/v1/agent/batches/:id/send', apiAuth, requireApiScope('agent:write'), async (req, res) => {
+  const batchId = param(req.params.id);
+  const pageAccessToken = process.env.MESSENGER_PAGE_ACCESS_TOKEN || '';
+  if (!pageAccessToken) return res.status(503).json({ error: 'MESSENGER_PAGE_ACCESS_TOKEN is not configured' });
+  const deliveryToken = randomUUID();
+  const claim = await prisma.$transaction(async tx => {
+    const candidate = await tx.agentMessageBatch.findUnique({ where: { id: batchId }, include: { conversation: true } });
+    if (!candidate) return { status: 'NOT_FOUND' as const };
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`${candidate.conversation.channel}:${candidate.conversation.customerId}`}))`;
+    const batch = await tx.agentMessageBatch.findUnique({ where: { id: batchId }, include: { conversation: true, messages: { orderBy: { receivedAt: 'desc' }, take: 1 } } });
+    if (!batch) return { status: 'NOT_FOUND' as const };
+    if (batch.status === 'PROCESSED') return { status: 'DELIVERED' as const };
+    if (batch.status !== 'READY_TO_SEND' || !batch.responseText) return { status: 'NOT_READY' as const };
+    if (batch.deliveryStatus === 'SENDING' || batch.deliveryStatus === 'AMBIGUOUS') return { status: 'AMBIGUOUS' as const };
+    if (batch.conversation.channel !== 'MESSENGER') return { status: 'UNSUPPORTED_CHANNEL' as const };
+    const batchLatest = batch.messages[0]?.receivedAt;
+    if (!batchLatest || batch.conversation.lastInboundAt?.getTime() !== batchLatest.getTime()) return { status: 'STALE' as const };
+    const won = await tx.agentMessageBatch.updateMany({ where: { id: batch.id, status: 'READY_TO_SEND', deliveryStatus: 'PENDING' }, data: { deliveryStatus: 'SENDING', deliveryStartedAt: new Date(), deliveryToken } });
+    if (won.count !== 1) return { status: 'AMBIGUOUS' as const };
+    return { status: 'CLAIMED' as const, batch };
+  });
+  if (claim.status === 'NOT_FOUND') return res.status(404).json({ error: 'Message batch not found' });
+  if (claim.status === 'DELIVERED') return res.json({ status: 'DELIVERED' });
+  if (claim.status === 'NOT_READY') return res.status(409).json({ error: 'Message batch is not ready to send' });
+  if (claim.status === 'STALE') return res.status(409).json({ error: 'A newer customer message superseded this reply' });
+  if (claim.status === 'AMBIGUOUS') return res.status(409).json({ error: 'Messenger delivery is already in progress or requires reconciliation' });
+  if (claim.status === 'UNSUPPORTED_CHANNEL') return res.status(400).json({ error: 'Unsupported delivery channel' });
+  const { batch } = claim;
+  try {
+    await sendMessengerText(batch.conversation.customerId, batch.responseText, pageAccessToken);
+  } catch (error) {
+    await prisma.agentMessageBatch.updateMany({ where: { id: batch.id, deliveryStatus: 'SENDING', deliveryToken }, data: { deliveryStatus: 'AMBIGUOUS' } });
+    throw error;
+  }
+  const finalized = await prisma.$transaction(async tx => {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`${batch.conversation.channel}:${batch.conversation.customerId}`}))`;
+    const fresh = await tx.agentMessageBatch.findUnique({ where: { id: batch.id }, include: { conversation: true, messages: { orderBy: { receivedAt: 'desc' }, take: 1 } } });
+    if (!fresh) return false;
+    const deliveredAt = new Date();
+    const won = await tx.agentMessageBatch.updateMany({ where: { id: batch.id, status: 'READY_TO_SEND', deliveryStatus: 'SENDING', deliveryToken }, data: { status: 'PROCESSED', processedAt: deliveredAt, deliveredAt, deliveryStatus: 'DELIVERED', deliveryStartedAt: null, deliveryToken: null } });
+    if (won.count !== 1) return false;
+    const batchLatest = fresh.messages[0]?.receivedAt;
+    if (batchLatest && fresh.conversation.lastInboundAt?.getTime() === batchLatest.getTime()) {
+      const [first, second] = scheduleFollowUps(fresh.conversation.lastInboundAt);
+      for (const [stage, dueAt] of [[1, first], [2, second]] as const) await tx.agentFollowUp.upsert({ where: { conversationId_stage: { conversationId: fresh.conversationId, stage } }, create: { conversationId: fresh.conversationId, stage, dueAt }, update: { dueAt, status: 'PENDING' } });
+    }
+    return true;
+  });
+  if (!finalized) return res.status(409).json({ error: 'Messenger delivery requires reconciliation' });
+  res.json({ status: 'DELIVERED' });
+});
+app.post('/api/v1/agent/batches/:id/reconcile-delivery', apiAuth, requireApiScope('agent:write'), async (req, res) => {
+  const parsed = agentDeliveryReconcileSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'Invalid delivery reconciliation', issues: parsed.error.issues });
+  const result = await prisma.agentMessageBatch.updateMany({ where: { id: param(req.params.id), status: 'READY_TO_SEND', OR: [{ deliveryStatus: 'AMBIGUOUS' }, { deliveryStatus: 'SENDING', deliveryStartedAt: { lte: new Date(Date.now() - 60_000) } }] }, data: { deliveryStatus: 'PENDING', deliveryStartedAt: null, deliveryToken: null } });
+  if (result.count !== 1) return res.status(409).json({ error: 'Delivery is not awaiting reconciliation' });
+  res.json({ status: 'PENDING' });
+});
 app.post('/api/v1/agent/batches/:id/delivered', apiAuth, requireApiScope('agent:write'), async (req, res) => {
   const batchId = param(req.params.id);
   await prisma.$transaction(async tx => {
@@ -282,7 +393,7 @@ app.post('/api/v1/agent/batches/:id/delivered', apiAuth, requireApiScope('agent:
     const batch = await tx.agentMessageBatch.findUnique({ where: { id: batchId }, include: { conversation: true, messages: { orderBy: { receivedAt: 'desc' }, take: 1 } } });
     if (!batch) return;
     const deliveredAt = new Date();
-    const won = await tx.agentMessageBatch.updateMany({ where: { id: batchId, status: 'READY_TO_SEND' }, data: { status: 'PROCESSED', processedAt: deliveredAt, deliveredAt } });
+    const won = await tx.agentMessageBatch.updateMany({ where: { id: batchId, status: 'READY_TO_SEND' }, data: { status: 'PROCESSED', processedAt: deliveredAt, deliveredAt, deliveryStatus: 'DELIVERED', deliveryStartedAt: null } });
     if (won.count !== 1) return;
     const batchLatest = batch.messages[0]?.receivedAt;
     if (!batchLatest || !batch.conversation.lastInboundAt || batch.conversation.lastInboundAt.getTime() !== batchLatest.getTime()) return;
@@ -308,6 +419,12 @@ app.post('/api/v1/agent/meetings', apiAuth, requireApiScope('agent:write'), asyn
   if (result.status === 'INVALID_SLOT' || result.status === 'MISSING_PLATFORM') return res.status(400).json(result);
   if (result.status === 'SLOT_TAKEN') return res.status(409).json(result);
   res.status(201).json(result);
+  if (result.status === 'CONFIRMED') setImmediate(() => {
+    void (async () => {
+      const event = await prisma.agentHandoffEvent.findUnique({ where: { idempotencyKey: `meeting:${result.reservation.id}` } });
+      if (event) await dispatchHandoffEvent(event.id);
+    })().catch(() => undefined);
+  });
 });
 app.post('/api/v1/agent/handoffs', apiAuth, requireApiScope('agent:write'), async (req, res) => {
   const parsed = agentHandoffInputSchema.safeParse(req.body);
@@ -320,6 +437,66 @@ app.post('/api/v1/agent/handoffs', apiAuth, requireApiScope('agent:write'), asyn
     create: input => prisma.agentHandoffEvent.create({ data: { ...input, payload: input.payload as Prisma.InputJsonValue } }),
   });
   res.status(existing ? 200 : 201).json(event);
+  if (!event.deliveredAt) setImmediate(() => { void dispatchHandoffEvent(event.id).catch(() => undefined); });
+});
+
+export async function dispatchHandoffEvent(eventId: string): Promise<{ status: 'NOT_FOUND' | 'DELIVERED' | 'BUSY'; odooLeadId?: number }> {
+  const urls = [...new Set((process.env.HUMAN_NOTIFICATION_WEBHOOK_URLS || '').split(',').map(value => value.trim()).filter(Boolean))];
+  const odoo = { url: process.env.ODOO_URL || '', database: process.env.ODOO_DATABASE || '', username: process.env.ODOO_USERNAME || '', apiKey: process.env.ODOO_API_KEY || '' };
+  if (Object.values(odoo).some(value => !value) || urls.length < 2) throw new Error('Odoo and at least two human notification channels must be configured');
+  const staleAt = new Date(Date.now() - 5 * 60_000);
+  const dispatchToken = randomUUID();
+  const claimed = await prisma.agentHandoffEvent.updateMany({ where: { id: eventId, deliveredAt: null, AND: [{ OR: [{ nextDispatchAt: null }, { nextDispatchAt: { lte: new Date() } }] }, { OR: [{ dispatchStatus: { in: ['PENDING', 'FAILED'] } }, { dispatchStatus: 'PROCESSING', dispatchStartedAt: { lte: staleAt } }] }] }, data: { dispatchStatus: 'PROCESSING', dispatchStartedAt: new Date(), dispatchToken, dispatchAttempts: { increment: 1 } } });
+  if (claimed.count !== 1) {
+    const current = await prisma.agentHandoffEvent.findUnique({ where: { id: eventId } });
+    if (!current) return { status: 'NOT_FOUND' };
+    return { status: current.deliveredAt ? 'DELIVERED' : 'BUSY' };
+  }
+  try {
+    const event = await prisma.agentHandoffEvent.findUnique({ where: { id: eventId } });
+    if (!event) return { status: 'NOT_FOUND' };
+    const payload = event.payload as Record<string, unknown>;
+    const integrationEvent = { idempotencyKey: event.idempotencyKey, type: event.type, summary: String(payload.summary || event.type), payload };
+    const state = (event.deliveryState && typeof event.deliveryState === 'object' && !Array.isArray(event.deliveryState) ? event.deliveryState : {}) as { odooLeadId?: number; alerts?: string[] };
+    if (!state.odooLeadId) {
+      state.odooLeadId = await syncLeadToOdoo(integrationEvent, odoo);
+      const saved = await prisma.agentHandoffEvent.updateMany({ where: { id: event.id, dispatchStatus: 'PROCESSING', dispatchToken }, data: { deliveryState: state as Prisma.InputJsonValue } });
+      if (saved.count !== 1) throw new Error('Handoff dispatch lease expired');
+    }
+    state.alerts ||= [];
+    for (const url of urls) {
+      const destination = `notification:${createHash('sha256').update(url).digest('hex').slice(0, 24)}`;
+      if (state.alerts.includes(destination)) continue;
+      await dispatchHumanAlert(integrationEvent, url);
+      state.alerts.push(destination);
+      const saved = await prisma.agentHandoffEvent.updateMany({ where: { id: event.id, dispatchStatus: 'PROCESSING', dispatchToken }, data: { deliveryState: state as Prisma.InputJsonValue } });
+      if (saved.count !== 1) throw new Error('Handoff dispatch lease expired');
+    }
+    const finished = await prisma.agentHandoffEvent.updateMany({ where: { id: event.id, dispatchStatus: 'PROCESSING', dispatchToken }, data: { deliveredAt: new Date(), dispatchStatus: 'DELIVERED', dispatchStartedAt: null, dispatchToken: null, nextDispatchAt: null, deliveryState: state as Prisma.InputJsonValue } });
+    if (finished.count !== 1) throw new Error('Handoff dispatch lease expired');
+    return { status: 'DELIVERED', odooLeadId: state.odooLeadId };
+  } catch (error) {
+    await prisma.agentHandoffEvent.updateMany({ where: { id: eventId, dispatchStatus: 'PROCESSING', dispatchToken }, data: { dispatchStatus: 'FAILED', dispatchStartedAt: null, dispatchToken: null, nextDispatchAt: new Date(Date.now() + 60_000) } });
+    throw error;
+  }
+}
+
+export async function processPendingHandoffs(limit = 10): Promise<number> {
+  const events = await prisma.agentHandoffEvent.findMany({ where: { deliveredAt: null, AND: [{ OR: [{ nextDispatchAt: null }, { nextDispatchAt: { lte: new Date() } }] }, { OR: [{ dispatchStatus: { in: ['PENDING', 'FAILED'] } }, { dispatchStatus: 'PROCESSING', dispatchStartedAt: { lte: new Date(Date.now() - 5 * 60_000) } }] }] }, orderBy: { createdAt: 'asc' }, take: limit, select: { id: true } });
+  let delivered = 0;
+  for (const event of events) {
+    try { if ((await dispatchHandoffEvent(event.id)).status === 'DELIVERED') delivered++; } catch { /* one poison event must not starve later leads */ }
+  }
+  return delivered;
+}
+
+app.post('/api/v1/agent/handoffs/:id/dispatch', apiAuth, requireApiScope('agent:write'), async (req, res) => {
+  const distinctNotificationUrls = new Set((process.env.HUMAN_NOTIFICATION_WEBHOOK_URLS || '').split(',').map(value => value.trim()).filter(Boolean));
+  if (!process.env.ODOO_URL || !process.env.ODOO_DATABASE || !process.env.ODOO_USERNAME || !process.env.ODOO_API_KEY || distinctNotificationUrls.size < 2) return res.status(503).json({ error: 'Odoo and at least two human notification channels must be configured' });
+  const result = await dispatchHandoffEvent(param(req.params.id));
+  if (result.status === 'NOT_FOUND') return res.status(404).json({ error: 'Handoff event not found' });
+  if (result.status === 'BUSY') return res.status(409).json({ error: 'Handoff event is already being dispatched' });
+  res.json(result);
 });
 app.post('/api/v1/agent/respond', apiAuth, requireApiScope('agent:write'), async (req, res) => {
   const parsed = agentResponseInputSchema.safeParse(req.body);
@@ -348,7 +525,7 @@ app.post('/api/v1/agent/respond', apiAuth, requireApiScope('agent:write'), async
   if (generationClaim.count !== 1) return res.status(409).json({ error: 'Message batch is already being generated' });
   try {
     const reply = await generateSalesReply({ persona: published.persona, configurationVersion: published.version, customerInput: batch.combinedInput, conversationState: batch.conversation.state as Record<string, unknown>, verifiedContext }, createSalesAiClient(apiKey));
-    const completed = await prisma.agentMessageBatch.updateMany({ where: { id: batch.id, status: 'GENERATING', generationToken }, data: { status: 'READY_TO_SEND', responseText: reply, configurationVersion: published.version, generationStartedAt: null, generationToken: null } });
+    const completed = await prisma.agentMessageBatch.updateMany({ where: { id: batch.id, status: 'GENERATING', generationToken }, data: { status: 'READY_TO_SEND', responseText: reply, configurationVersion: published.version, generationStartedAt: null, generationToken: null, deliveryStatus: 'PENDING', deliveryStartedAt: null } });
     if (completed.count !== 1) return res.status(409).json({ error: 'Generation lease expired; retry the batch' });
     res.json({ reply, configurationVersion: published.version });
   } catch {

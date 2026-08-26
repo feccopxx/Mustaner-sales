@@ -24,6 +24,7 @@
     "dotenv": "^17.4.2",
     "express": "^5.1.0",
     "express-rate-limit": "^8.0.1",
+    "ffmpeg-static": "^5.2.0",
     "helmet": "^8.1.0",
     "jose": "^6.0.12",
     "lucide-react": "^0.539.0",

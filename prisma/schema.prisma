@@ -167,6 +167,12 @@ model AgentMessage {
   normalizedText  String            @db.Text
   occurredAt      DateTime
   receivedAt      DateTime
+  mediaUrl        String?           @db.Text
+  mediaStatus     String            @default("READY")
+  mediaStartedAt  DateTime?
+  mediaLeaseToken String?
+  mediaAttempts   Int               @default(0)
+  mediaError      String?           @db.Text
   createdAt       DateTime          @default(now())
   conversationId  String
   conversation    AgentConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
@@ -175,6 +181,7 @@ model AgentMessage {
 
   @@unique([conversationId, sourceMessageId])
   @@index([conversationId, occurredAt])
+  @@index([mediaStatus, receivedAt])
 }
 
 model AgentMessageBatch {
@@ -188,6 +195,9 @@ model AgentMessageBatch {
   generationToken String?
   processedAt    DateTime?
   deliveredAt    DateTime?
+  deliveryStatus String            @default("PENDING")
+  deliveryStartedAt DateTime?
+  deliveryToken  String?
   createdAt      DateTime          @default(now())
   conversationId String
   conversation   AgentConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
@@ -229,6 +239,13 @@ model AgentHandoffEvent {
   payload        Json
   createdAt      DateTime @default(now())
   deliveredAt    DateTime?
+  dispatchStatus String   @default("PENDING")
+  dispatchStartedAt DateTime?
+  dispatchToken  String?
+  dispatchAttempts Int      @default(0)
+  nextDispatchAt DateTime?
+  deliveryState  Json     @default("{}")
 
   @@index([type, createdAt])
+  @@index([dispatchStatus, createdAt])
 }

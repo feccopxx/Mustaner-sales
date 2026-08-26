@@ -73,6 +73,7 @@ export const agentInboundMessageSchema = z.object({
 });
 
 export const agentBatchClaimSchema = z.object({ now: z.iso.datetime().optional() });
+export const agentDeliveryReconcileSchema = z.object({ action: z.literal('CONFIRM_NOT_SENT') });
 
 const mediaLinkSchema = z.object({
   label: z.string().trim().min(1).max(120),

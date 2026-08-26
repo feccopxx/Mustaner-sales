@@ -16,6 +16,7 @@ export function nextBatchFlushAt(latestMessageAt: Date): Date {
 export function normalizeInboundMessage(message: InboundMessage): string {
   const text = message.text.trim();
   if (message.kind === 'TEXT' || message.kind === 'VOICE') return text;
+  if (/^User sent .+ with these details:/i.test(text)) return text.split(/\r?\n/).slice(0, 5).join('\n');
   const summary = text.split(/\r?\n/).map(line => line.trim()).filter(Boolean).slice(0, 5).join('\n');
   return `User sent a ${message.kind} with these details:\n${summary}`;
 }
