@@ -22,7 +22,7 @@ app.use(express.json({ limit: '1mb' }));
 app.use(cookieParser());
 app.use('/api', csrfGuard);
 
-const loginLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 8, standardHeaders: true, legacyHeaders: false, skipSuccessfulRequests: true });
+const loginLimiter = rateLimit({ windowMs: 5 * 60_000, limit: 12, standardHeaders: true, legacyHeaders: false, skipSuccessfulRequests: true, handler: (_req, res) => { res.status(429).json({ error: 'Too many login attempts. Try again in a few minutes.' }); } });
 
 app.get('/api/health', (_req, res) => res.json({ status: 'ok' }));
 app.get('/api/auth/session', requireAdmin, (_req, res) => res.json({ authenticated: true }));
