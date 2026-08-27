@@ -30,3 +30,10 @@ export function verifyApiKey(plaintext: string, expectedHex: string) {
   const expected = Buffer.from(expectedHex, 'hex');
   return actual.length === expected.length && timingSafeEqual(actual, expected);
 }
+
+export function verifyConfiguredApiKey(plaintext: string, configuredKey: string) {
+  if (!plaintext || !configuredKey) return false;
+  const actual = digest(plaintext);
+  const expected = digest(configuredKey);
+  return timingSafeEqual(actual, expected);
+}

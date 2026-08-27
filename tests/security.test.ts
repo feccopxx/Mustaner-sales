@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { createApiKey, hashPassword, synchronizePasswordHash, verifyApiKey, verifyPassword } from '../server/security.js';
+import { createApiKey, hashPassword, synchronizePasswordHash, verifyApiKey, verifyConfiguredApiKey, verifyPassword } from '../server/security.js';
 
 describe('security primitives', () => {
   it('hashes and verifies the app password with Argon2id', async () => {
@@ -24,5 +24,11 @@ describe('security primitives', () => {
     expect(key.hash).not.toContain(key.plaintext);
     expect(verifyApiKey(key.plaintext, key.hash)).toBe(true);
     expect(verifyApiKey('mstr_wrong', key.hash)).toBe(false);
+  });
+
+  it('verifies the configured agent key without exposing its value', () => {
+    expect(verifyConfiguredApiKey('mstr_agent_key', 'mstr_agent_key')).toBe(true);
+    expect(verifyConfiguredApiKey('mstr_wrong', 'mstr_agent_key')).toBe(false);
+    expect(verifyConfiguredApiKey('', 'mstr_agent_key')).toBe(false);
   });
 });

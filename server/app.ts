@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { createHash, randomUUID } from 'node:crypto';
 import { prisma } from './prisma.js';
 import { agentBatchClaimSchema, agentConfigurationDraftSchema, agentDeliveryReconcileSchema, agentHandoffInputSchema, agentInboundMessageSchema, agentMeetingInputSchema, agentResponseInputSchema, courseInputSchema, globalFieldInputSchema } from './domain.js';
-import { createApiKey, hashPassword, synchronizePasswordHash, verifyApiKey, verifyPassword } from './security.js';
+import { createApiKey, hashPassword, synchronizePasswordHash, verifyApiKey, verifyConfiguredApiKey, verifyPassword } from './security.js';
 import { csrfGuard, issueSession, newCsrfToken, requireAdmin } from './auth.js';
 import { projectCourse } from './course-projection.js';
 import multer from 'multer';
@@ -203,6 +203,10 @@ app.get('/api/admin/audit', requireAdmin, async (_req, res) => res.json(await pr
 async function apiAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
   const plaintext = req.header('x-api-key') || req.header('authorization')?.replace(/^Bearer\s+/i, '');
   if (!plaintext) return res.status(401).json({ error: 'API key required' });
+  if (verifyConfiguredApiKey(plaintext, process.env.MUSTANER_AGENT_API_KEY || '')) {
+    res.locals.scopes = ['courses:read', 'sales-guidance:read', 'agent:read', 'agent:write'];
+    return next();
+  }
   const candidates = await prisma.apiKey.findMany({ where: { revokedAt: null } });
   const key = candidates.find((candidate) => verifyApiKey(plaintext, candidate.keyHash));
   if (!key) return res.status(401).json({ error: 'Invalid API key' });
