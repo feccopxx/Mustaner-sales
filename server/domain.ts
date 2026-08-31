@@ -54,7 +54,7 @@ export const agentHandoffInputSchema = z.discriminatedUnion('type', [
   handoffBase.extend({ type: z.literal('AI_AUTOMATION_LEAD'), payload: z.object({ ...eventContext, qualificationStatus: z.enum(['qualified', 'needs_human_discovery']), phone: z.string().trim().min(5).max(40), name: z.string().trim().max(240).optional(), qualificationReason: z.string().trim().max(240).optional() }) }),
   handoffBase.extend({ type: z.literal('MEETING_CONFIRMED'), payload: z.object({ ...eventContext, reservationId: z.string().min(1), customerId: z.string().min(1), customerName: z.string().min(1), phone: z.string().min(5), startsAt: z.iso.datetime(), mode: z.enum(['ONLINE', 'FACE_TO_FACE']), platform: z.enum(['GOOGLE_MEET', 'ZOOM', 'DISCORD']).optional() }) }),
   handoffBase.extend({ type: z.literal('CONSULTATION_REQUEST'), payload: z.object({ ...eventContext, phone: z.string().trim().min(5).max(40), reason: z.string().trim().min(1).max(2_000), name: z.string().trim().max(240).optional() }) }),
-  handoffBase.extend({ type: z.literal('COURSE_ENROLLMENT'), payload: z.object({ ...eventContext, courseId: z.string().min(1), email: z.email(), phone: z.string().min(5), paymentPreference: z.string().min(1), name: z.string().max(240).optional() }) }),
+  handoffBase.extend({ type: z.literal('COURSE_ENROLLMENT'), payload: z.object({ ...eventContext, courseId: z.string().min(1), email: z.email(), phone: z.string().min(5), paymentPreference: z.string().min(1).optional(), name: z.string().max(240).optional() }) }),
 ]);
 
 export const agentResponseInputSchema = z.object({

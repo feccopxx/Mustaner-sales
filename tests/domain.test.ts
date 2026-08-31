@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { detectDirection, renderMarkdown, validateCourseInput } from '../server/domain.js';
+import { agentHandoffInputSchema, detectDirection, renderMarkdown, validateCourseInput } from '../server/domain.js';
 
 describe('course content domain', () => {
   it('detects Arabic-leading mixed content as RTL', () => {
@@ -23,5 +23,24 @@ describe('course content domain', () => {
       mediaLinks: [],
     });
     expect(result.success).toBe(false);
+  });
+});
+
+describe('course enrollment handoff', () => {
+  it('accepts phone and email before payment details are confirmed by a human', () => {
+    const result = agentHandoffInputSchema.safeParse({
+      type: 'COURSE_ENROLLMENT',
+      idempotencyKey: 'messenger:customer:execution:COURSE_ENROLLMENT',
+      payload: {
+        sourceChannel: 'MESSENGER',
+        summary: 'Learner accepted the online course schedule and requested enrollment follow-up.',
+        configurationVersion: 1,
+        courseId: '01',
+        email: 'learner@example.com',
+        phone: '01012345678',
+      },
+    });
+
+    expect(result.success).toBe(true);
   });
 });
